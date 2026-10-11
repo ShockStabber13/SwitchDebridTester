@@ -3,6 +3,7 @@
 #include "downloader.h"
 #include "auth.h"
 #include "alldebrid_pin.h"
+#include "torbox.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -2093,6 +2094,15 @@ static void send_page(
         "Download through AllDebrid"
         "</button>"
 
+        "<hr>"
+        "<p>Network-only test: paste a <b>direct, authorized "
+        "download URL</b> above. The test discards received "
+        "bytes and does not save a file.</p>"
+        "<button type='submit' formaction='/diag-parallel-url'>"
+        "Test AllDebrid URL (1 vs 3)</button> "
+        "<button type='submit' formaction='/torbox-test'>"
+        "Test TorBox URL (1 vs 3)</button>"
+
         "</form>"
 
         "<hr>"
@@ -2110,7 +2120,18 @@ static void send_page(
         "Reload config.ini"
         "</a>"
         "</p>"
-        "</body></html>";
+        "<hr>"
+        "<h3>TorBox account</h3>"
+        "<p><a href='/torbox-connect'>Connect TorBox</a>"
+        " | <a href='/torbox-check'>Check authorization</a>"
+        " | <a href='/torbox-files'>Refresh cloud files</a>"
+        " | <a href='/torbox-disconnect'>Disconnect</a></p>"
+        "<p>Authorize via the official TorBox website. "
+        "Then select a file below to run the same network-only "
+        "1-versus-3-stream test. No manual IDs or URLs needed.</p>"
+        "<p>Use this web interface only on a trusted local network."
+        " The local HTTP connection is not encrypted.</p>";
+    static const char footer[] = "</body></html>";
 
     char safe_message[4096];
 
@@ -2158,7 +2179,6 @@ static void send_page(
         g_alldebrid_connected
             ? "CONNECTED - session only"
             : "NOT CONNECTED",
-
         g_alldebrid_name[0]
             ? g_alldebrid_name
             : "SwitchDebridDownloader",
@@ -2172,10 +2192,74 @@ static void send_page(
         safe_error
     );
 
+    static char torbox_section[64000];
+    size_t torbox_length = 0;
+    torbox_section[0] = '\0';
+
+    if (torbox_connected()) {
+        torbox_length = (size_t)snprintf(
+            torbox_section, sizeof(torbox_section),
+            "<p><b>TorBox: Connected</b> | %zu cloud files available "
+            "(first 96 eligible entries).</p>",
+            torbox_file_count());
+        if (torbox_file_count()) {
+            const int n = snprintf(torbox_section + torbox_length,
+                 sizeof(torbox_section) - torbox_length,
+                 "<form method='POST' action='/torbox-benchmark'>"
+                 "<p>Select a cloud file to benchmark:</p>");
+            if (n > 0 && (size_t)n < sizeof(torbox_section) - torbox_length)
+                torbox_length += (size_t)n;
+            for (size_t i = 0; i < torbox_file_count(); ++i) {
+                char escaped_name[1100] = {0};
+                html_escape(torbox_file_name(i), escaped_name, sizeof(escaped_name));
+                const double mib =
+                    (double)torbox_file_size(i) / (1024.0 * 1024.0);
+                const int written = snprintf(
+                    torbox_section + torbox_length,
+                    sizeof(torbox_section) - torbox_length,
+                    "<p><button name='file_index' value='%zu' type='submit'>"
+                    "Test</button> %s (%.0f MiB)</p>", i, escaped_name, mib);
+                if (written < 0 || (size_t)written >=
+                    sizeof(torbox_section) - torbox_length)
+                    break;
+                torbox_length += (size_t)written;
+            }
+            const int n2 = snprintf(
+                torbox_section + torbox_length,
+                sizeof(torbox_section) - torbox_length,
+                "</form>");
+            if (n2 > 0 && (size_t)n2 < sizeof(torbox_section) - torbox_length)
+                torbox_length += (size_t)n2;
+        } else {
+            const int n = snprintf(torbox_section + torbox_length,
+                sizeof(torbox_section) - torbox_length,
+                "<p>No eligible cloud files loaded yet. "
+                "Click Refresh cloud files after authorization.</p>");
+            if (n > 0 && (size_t)n < sizeof(torbox_section) - torbox_length)
+                torbox_length += (size_t)n;
+        }
+    } else if (torbox_auth_pending()) {
+        const char *code = torbox_auth_code();
+        torbox_length = (size_t)snprintf(
+            torbox_section, sizeof(torbox_section),
+            "<p>TorBox verification code: <b>%s</b></p>"
+            "<p>Open <a href='https://tor.box/link'>https://tor.box/link</a>, "
+            "enter the code and approve access. Then click "
+            "<a href='/torbox-check'>Check authorization</a>.</p>",
+            code);
+    } else {
+        torbox_length = (size_t)snprintf(
+            torbox_section, sizeof(torbox_section),
+            "<p>TorBox: Not connected. Click Connect TorBox above.</p>");
+    }
+    // No TorBox token or CDN URL is ever printed to the browser.
+
     size_t body_length =
         sizeof(top) - 1 +
         strlen(status) +
-        sizeof(form) - 1;
+        sizeof(form) - 1 +
+        torbox_length +
+        sizeof(footer) - 1;
 
     char header[512];
 
@@ -2217,6 +2301,8 @@ static void send_page(
         form,
         sizeof(form) - 1
     );
+    send_all(fd, torbox_section, torbox_length);
+    send_all(fd, footer, sizeof(footer) - 1);
 }
 
 
@@ -2497,6 +2583,144 @@ static void handle_client(
         return;
     }
 
+
+    // TorBox device authorization and cloud-file browser.
+    // All endpoints are after the existing authenticated LAN session check.
+    if (strncmp(g_request, "GET /torbox-connect ", 20) == 0) {
+        char error[512] = {0};
+        const bool ok = torbox_start_auth(error, sizeof(error));
+        send_page(fd, ok
+            ? "TorBox code created. Complete authorization at tor.box/link."
+            : error);
+        return;
+    }
+    if (strncmp(g_request, "GET /torbox-check ", 18) == 0) {
+        char error[512] = {0};
+        const bool ok = torbox_poll_auth(error, sizeof(error));
+        if (ok) {
+            char list_error[512] = {0};
+            if (!torbox_refresh_files(list_error, sizeof(list_error))) {
+                send_page(fd, "TorBox connected. Cloud list unavailable; retry Refresh.");
+            } else {
+                send_page(fd, "TorBox connected. Choose a cloud file below.");
+            }
+        } else send_page(fd, error);
+        return;
+    }
+    if (strncmp(g_request, "GET /torbox-files ", 18) == 0) {
+        char error[512] = {0};
+        const bool ok = torbox_refresh_files(error, sizeof(error));
+        send_page(fd, ok
+            ? (error[0] ? error : "TorBox cloud files refreshed.")
+            : error);
+        return;
+    }
+    if (strncmp(g_request, "GET /torbox-disconnect ", 23) == 0) {
+        torbox_disconnect();
+        send_page(fd, "TorBox disconnected; authorization cleared from RAM.");
+        return;
+    }
+    if (strncmp(g_request, "POST /torbox-benchmark ", 23) == 0) {
+        char *body = strstr(g_request, "\r\n\r\n");
+        if (!body) {
+            send_page(fd, "Invalid cloud-file selection.");
+            return;
+        }
+        char index_string[24] = {0};
+        form_value(body + 4, "file_index", index_string, sizeof(index_string));
+        if (!index_string[0] ||
+            strspn(index_string, "0123456789") != strlen(index_string)) {
+            send_page(fd, "Choose a cloud file from the list.");
+            return;
+        }
+        const unsigned long index = strtoul(index_string, NULL, 10);
+        if (index >= torbox_file_count()) {
+            send_page(fd, "Cloud-file selection expired. Refresh the list.");
+            return;
+        }
+        char signed_url[8192] = {0};
+        char error[512] = {0};
+        const bool resolved = torbox_file_url((size_t)index,
+            signed_url, sizeof(signed_url), error, sizeof(error));
+        if (!resolved) {
+            memset(signed_url, 0, sizeof(signed_url));
+            send_page(fd, error);
+            return;
+        }
+        double speeds[5] = {0};
+        unsigned long long bytes[5] = {0};
+        int failed = 0;
+        const bool ok = downloader_debug_raw_url_parallel_sweep(
+            signed_url, speeds, bytes, &failed, error, sizeof(error));
+        memset(signed_url, 0, sizeof(signed_url));
+        char message[1024];
+        if (ok) {
+            snprintf(message, sizeof(message),
+                "TorBox HTTP-only: 1 stream %.2f MiB/s | "
+                "3 streams %.2f MiB/s | ratio %.2fx (no SD writes)",
+                speeds[0], speeds[1],
+                speeds[0] > 0 ? speeds[1] / speeds[0] : 0.0);
+        } else {
+            snprintf(message, sizeof(message),
+                "TorBox network test failed at %d streams: %s "
+                "(1x %.2f, 3x %.2f MiB/s)",
+                failed, error, speeds[0], speeds[1]);
+        }
+        send_page(fd, message);
+        return;
+    }
+
+    // Same pasted-URL benchmark used for AllDebrid.
+    // The caller must supply an already-resolved TorBox CDN URL.
+    // The signed URL is not printed, persisted or sent to the browser.
+    if (strncmp(g_request, "POST /torbox-test ", 18) == 0) {
+        char *body = strstr(g_request, "\r\n\r\n");
+        if (!body) {
+            send_page(fd, "Invalid TorBox test request.");
+            return;
+        }
+        char links[8192] = {0};
+        char url[8192] = {0};
+        form_value(body + 4, "links", links, sizeof(links));
+        if (!first_link(links, url, sizeof(url))) {
+            memset(links, 0, sizeof(links));
+            send_page(fd, "Paste a TorBox direct download URL above.");
+            return;
+        }
+        memset(links, 0, sizeof(links));
+
+        // Never feed a TorBox account page or a non-HTTPS destination
+        // to the benchmark. An account page is not a download link.
+        if (strncmp(url, "https://", 8) != 0 ||
+            strpbrk(url, "\r\n\\") != NULL) {
+            memset(url, 0, sizeof(url));
+            send_page(fd, "Use the final HTTPS download link from TorBox.");
+            return;
+        }
+
+        double speeds[5] = {0};
+        unsigned long long bytes[5] = {0};
+        int failed = 0;
+        char error[512] = {0};
+        const bool ok = downloader_debug_raw_url_parallel_sweep(
+            url, speeds, bytes, &failed, error, sizeof(error));
+        memset(url, 0, sizeof(url));
+        char report[1024];
+        if (ok) {
+            snprintf(report, sizeof(report),
+                "TorBox network-only: 1 stream %.2f MiB/s | "
+                "3 streams %.2f MiB/s | ratio %.2fx | no SD writes",
+                speeds[0], speeds[1],
+                speeds[0] > 0.0 ? speeds[1] / speeds[0] : 0.0);
+        } else {
+            snprintf(report, sizeof(report),
+                "TorBox speed test failed at %d stream(s): %s "
+                "(1 stream %.2f, 3 streams %.2f MiB/s)",
+                failed, error, speeds[0], speeds[1]);
+        }
+        send_page(fd, report);
+        return;
+    }
 
     if (
         strncmp(
@@ -4752,6 +4976,7 @@ int main(
     );
 
     alldebrid_pin_reset();
+    torbox_disconnect();
 
     downloader_set_token(
         ""
