@@ -16,6 +16,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Clean stale locally generated build outputs
+        run: make clean
       - name: Build NRO
         run: make -j2
       - uses: actions/upload-artifact@v4
