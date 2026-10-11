@@ -3,6 +3,7 @@
 #include "downloader.h"
 #include "auth.h"
 #include "alldebrid_pin.h"
+#include "torbox.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -131,9 +132,12 @@ static void refresh_switch_status_if_due(void)
     );
 
     printf(
-        "AllDebrid: %s\n\n",
+        "AllDebrid: %s\nTorBox: %s\n\n",
         g_alldebrid_connected
             ? "CONNECTED"
+            : "NOT CONNECTED",
+        torbox_has_api_key()
+            ? "API KEY LOADED (RAM only)"
             : "NOT CONNECTED"
     );
 
@@ -2110,6 +2114,33 @@ static void send_page(
         "Reload config.ini"
         "</a>"
         "</p>"
+        "<hr>"
+        "<h3>TorBox - network-only speed test</h3>"
+        "<p>Use Torrent or WebDL IDs from your TorBox account."
+        " Tests discard downloaded bytes; nothing is saved to SD.</p>"
+        "<form method='POST' action='/torbox-connect'>"
+        "<label>TorBox API key (session RAM only)</label><br>"
+        "<input type='password' name='api_key' "
+        "autocomplete='off' required style='width:100%'>"
+        "<br><button type='submit'>Connect TorBox</button>"
+        "</form>"
+        "<form method='POST' action='/torbox-test'>"
+        "<label>TorBox source</label><br>"
+        "<select name='torbox_type'>"
+        "<option value='torrents'>Torrent</option>"
+        "<option value='webdl'>WebDL</option>"
+        "</select><br>"
+        "<label>Torrent / WebDL ID</label><br>"
+        "<input name='torbox_id' required inputmode='numeric'><br>"
+        "<label>File ID</label><br>"
+        "<input name='file_id' required inputmode='numeric'><br>"
+        "<button type='submit'>Test TorBox 1 vs 3 streams</button>"
+        "</form>"
+        "<form method='POST' action='/torbox-disconnect'>"
+        "<button type='submit'>Disconnect TorBox</button>"
+        "</form>"
+        "<p>Use this dashboard only on a trusted local network: "
+        "its built-in web server uses HTTP, not HTTPS.</p>"
         "</body></html>";
 
     char safe_message[4096];
@@ -2142,6 +2173,7 @@ static void send_page(
 
         "<p>"
         "AllDebrid: <b>%s</b><br>"
+        "TorBox: <b>%s</b><br>"
         "Name: <b>%s</b><br>"
         "Max simultaneous downloads: <b>%d</b><br>"
         "Last submitted: <b>%u</b><br>"
@@ -2157,6 +2189,9 @@ static void send_page(
 
         g_alldebrid_connected
             ? "CONNECTED - session only"
+            : "NOT CONNECTED",
+        torbox_has_api_key()
+            ? "API KEY LOADED - RAM only"
             : "NOT CONNECTED",
 
         g_alldebrid_name[0]
@@ -2497,6 +2532,85 @@ static void handle_client(
         return;
     }
 
+
+    // These TorBox actions are AFTER authenticated-session validation.
+    // Credentials never appear in GET URLs, page HTML, or configuration.
+    if (strncmp(g_request, "POST /torbox-connect ", 21) == 0) {
+        char *body = strstr(g_request, "\r\n\r\n");
+        if (!body) {
+            send_page(fd, "Invalid TorBox connection request.");
+            return;
+        }
+        char key[1024] = {0};
+        form_value(body + 4, "api_key", key, sizeof(key));
+        const bool ok = torbox_set_api_key(key);
+        memset(key, 0, sizeof(key));
+        send_page(fd, ok
+            ? "TorBox API key loaded in RAM; not saved to SD."
+            : "Invalid TorBox API key.");
+        return;
+    }
+
+    if (strncmp(g_request, "POST /torbox-disconnect ", 24) == 0) {
+        torbox_clear_api_key();
+        send_page(fd, "TorBox disconnected and key cleared from RAM.");
+        return;
+    }
+
+    if (strncmp(g_request, "POST /torbox-test ", 18) == 0) {
+        char *body = strstr(g_request, "\r\n\r\n");
+        if (!body) {
+            send_page(fd, "Invalid TorBox test request.");
+            return;
+        }
+        char type[32] = {0};
+        char id[64] = {0};
+        char file_id[64] = {0};
+        char url[8192] = {0};
+        char error[512] = {0};
+        form_value(body + 4, "torbox_type", type, sizeof(type));
+        form_value(body + 4, "torbox_id", id, sizeof(id));
+        form_value(body + 4, "file_id", file_id, sizeof(file_id));
+        if (strcmp(type, "torrents") != 0 &&
+            strcmp(type, "webdl") != 0) {
+            send_page(fd, "Choose TorBox Torrent or WebDL.");
+            return;
+        }
+        const bool resolved = torbox_resolve_download(
+            strcmp(type, "webdl") == 0, id, file_id,
+            url, sizeof(url), error, sizeof(error));
+        memset(id, 0, sizeof(id));
+        memset(file_id, 0, sizeof(file_id));
+        if (!resolved) {
+            memset(url, 0, sizeof(url));
+            send_page(fd, error[0] ? error :
+                "TorBox couldn't resolve that file.");
+            return;
+        }
+
+        double speeds[5] = {0};
+        unsigned long long bytes[5] = {0};
+        int failed = 0;
+        const bool ok = downloader_debug_raw_url_parallel_sweep(
+            url, speeds, bytes, &failed, error, sizeof(error));
+        // Signed CDN links are sensitive, so never display or persist them.
+        memset(url, 0, sizeof(url));
+        char report[1024];
+        if (ok) {
+            snprintf(report, sizeof(report),
+                "TorBox network-only: 1 stream %.2f MiB/s | "
+                "3 streams %.2f MiB/s | ratio %.2fx | no SD writes",
+                speeds[0], speeds[1],
+                speeds[0] > 0.0 ? speeds[1] / speeds[0] : 0.0);
+        } else {
+            snprintf(report, sizeof(report),
+                "TorBox speed test failed at %d stream(s): %s "
+                "(1 stream %.2f, 3 streams %.2f MiB/s)",
+                failed, error, speeds[0], speeds[1]);
+        }
+        send_page(fd, report);
+        return;
+    }
 
     if (
         strncmp(
@@ -4752,6 +4866,7 @@ int main(
     );
 
     alldebrid_pin_reset();
+    torbox_clear_api_key();
 
     downloader_set_token(
         ""
