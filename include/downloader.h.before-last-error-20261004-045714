@@ -1,0 +1,177 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+
+typedef struct {
+    int queued;
+    int active;
+    int completed;
+    int failed;
+
+    unsigned long long current_downloaded;
+    unsigned long long current_total;
+    unsigned long long current_bytes_per_second;
+
+    char current_file[1024];
+} DownloaderStats;
+
+bool downloader_init(
+    const char *token,
+    const char *user_agent,
+    int max_concurrent
+);
+
+void downloader_shutdown(void);
+
+void downloader_set_token(
+    const char *token
+);
+
+bool downloader_debug_raw_parallel_8(
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_debug_raw_url_parallel_sweep(
+    const char *direct_url,
+    double speeds[5],
+    unsigned long long bytes_tested[5],
+    int *failed_stream_count,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_debug_raw_url(
+    const char *direct_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_debug_raw_network(
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_debug_full_get(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_debug_edge_ua(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_debug_http2(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    long *http_version_used,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_debug_segmented_8(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_debug_segmented_16(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+);
+
+void downloader_get_curl_runtime_info(
+    char *version,
+    size_t version_size,
+    char *ssl,
+    size_t ssl_size,
+    bool *http2_supported
+);
+
+bool downloader_debug_segmented(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+);
+
+
+typedef struct {
+    char host[256];
+    char primary_ip[64];
+
+    long http_status;
+    long http_version;
+
+    double dns_seconds;
+    double tcp_seconds;
+    double tls_seconds;
+    double ttfb_seconds;
+    double total_seconds;
+} DownloaderConnectionInfo;
+
+bool downloader_debug_direct_metadata(
+    const char *source_url,
+    DownloaderConnectionInfo *info,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_unlock_direct_url(
+    const char *source_url,
+    char *direct_url,
+    size_t direct_url_size,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_debug_network(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_debug_sd(
+    double *mb_per_second,
+    char *error,
+    size_t error_size
+);
+
+bool downloader_enqueue(
+    const char *url
+);
+
+bool downloader_enqueue_direct(
+    const char *url
+);
+
+bool downloader_enqueue_alldebrid(
+    const char *url
+);
+
+void downloader_get_stats(
+    DownloaderStats *stats
+);

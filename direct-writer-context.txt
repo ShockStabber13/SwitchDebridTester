@@ -1,0 +1,1132 @@
+  2650	
+  2651	        if (elapsed >= 0.5) {
+  2652	            unsigned long long current =
+  2653	                dlnow >= 0
+  2654	                    ? (unsigned long long)dlnow
+  2655	                    : 0;
+  2656	
+  2657	            unsigned long long delta =
+  2658	                current >= wp->last_downloaded
+  2659	                    ? current - wp->last_downloaded
+  2660	                    : 0;
+  2661	
+  2662	            wp->bytes_per_second =
+  2663	                (unsigned long long)(
+  2664	                    (double)delta /
+  2665	                    elapsed
+  2666	                );
+  2667	
+  2668	            wp->last_downloaded =
+  2669	                current;
+  2670	
+  2671	            wp->last_time =
+  2672	                now;
+  2673	        }
+  2674	    }
+  2675	    else {
+  2676	        wp->last_downloaded =
+  2677	            dlnow >= 0
+  2678	                ? (unsigned long long)dlnow
+  2679	                : 0;
+  2680	
+  2681	        wp->last_time =
+  2682	            now;
+  2683	    }
+  2684	
+  2685	    mutexUnlock(
+  2686	        &g_mutex
+  2687	    );
+  2688	
+  2689	    return
+  2690	        g_running
+  2691	            ? 0
+  2692	            : 1;
+  2693	}
+  2694	
+  2695	
+  2696	/* ========================================================= */
+  2697	/* Four-connection file downloader                           */
+  2698	/* ========================================================= */
+  2699	
+  2700	#define DOWNLOAD_SEGMENTS 3
+  2701	
+  2702	
+  2703	
+  2704	
+  2705	typedef struct {
+  2706	    int worker_index;
+  2707	    unsigned long long total;
+  2708	    unsigned long long segment_downloaded[DOWNLOAD_SEGMENTS];
+  2709	} SegmentedDownloadState;
+  2710	
+  2711	
+  2712	typedef struct {
+  2713	    FILE *file;
+  2714	    SegmentedDownloadState *state;
+  2715	    int segment_index;
+  2716	
+  2717	    unsigned char *io_buffer;
+  2718	    size_t io_used;
+  2719	    size_t io_capacity;
+  2720	    bool io_failed;
+  2721	} SegmentDownloadContext;
+  2722	
+  2723	
+  2724	typedef struct {
+  2725	    size_t received;
+  2726	    size_t limit;
+  2727	} RangeProbeContext;
+  2728	
+  2729	
+  2730	static size_t range_probe_write(
+  2731	    char *ptr,
+  2732	    size_t size,
+  2733	    size_t nmemb,
+  2734	    void *userdata
+  2735	)
+  2736	{
+  2737	    (void)ptr;
+  2738	
+  2739	    RangeProbeContext *ctx =
+  2740	        (RangeProbeContext *)userdata;
+  2741	
+  2742	    size_t bytes =
+  2743	        size * nmemb;
+  2744	
+  2745	    if (
+  2746	        bytes > ctx->limit -
+  2747	        (
+  2748	            ctx->received < ctx->limit
+  2749	                ? ctx->received
+  2750	                : ctx->limit
+  2751	        )
+  2752	    ) {
+  2753	        return 0;
+  2754	    }
+  2755	
+  2756	    ctx->received += bytes;
+  2757	    return bytes;
+  2758	}
+  2759	
+  2760	
+  2761	static bool server_supports_byte_ranges(
+  2762	    const char *url
+  2763	)
+  2764	{
+  2765	    CURL *curl =
+  2766	        curl_easy_init();
+  2767	
+  2768	    if (!curl)
+  2769	        return false;
+  2770	
+  2771	    RangeProbeContext probe = {
+  2772	        .received = 0,
+  2773	        .limit = 4096
+  2774	    };
+  2775	
+  2776	    curl_easy_setopt(
+  2777	        curl,
+  2778	        CURLOPT_URL,
+  2779	        url
+  2780	    );
+  2781	
+  2782	    curl_easy_setopt(
+  2783	        curl,
+  2784	        CURLOPT_RANGE,
+  2785	        "0-0"
+  2786	    );
+  2787	
+  2788	    curl_easy_setopt(
+  2789	        curl,
+  2790	        CURLOPT_FOLLOWLOCATION,
+  2791	        1L
+  2792	    );
+  2793	
+  2794	    curl_easy_setopt(
+  2795	        curl,
+  2796	        CURLOPT_MAXREDIRS,
+  2797	        10L
+  2798	    );
+  2799	
+  2800	    curl_easy_setopt(
+  2801	        curl,
+  2802	        CURLOPT_WRITEFUNCTION,
+  2803	        range_probe_write
+  2804	    );
+  2805	
+  2806	    curl_easy_setopt(
+  2807	        curl,
+  2808	        CURLOPT_WRITEDATA,
+  2809	        &probe
+  2810	    );
+  2811	
+  2812	    curl_easy_setopt(
+  2813	        curl,
+  2814	        CURLOPT_CONNECTTIMEOUT,
+  2815	        30L
+  2816	    );
+  2817	
+  2818	    curl_easy_setopt(
+  2819	        curl,
+  2820	        CURLOPT_TIMEOUT,
+  2821	        30L
+  2822	    );
+  2823	
+  2824	    curl_easy_setopt(
+  2825	        curl,
+  2826	        CURLOPT_NOSIGNAL,
+  2827	        1L
+  2828	    );
+  2829	
+  2830	    curl_easy_setopt(
+  2831	        curl,
+  2832	        CURLOPT_SSL_VERIFYPEER,
+  2833	        1L
+  2834	    );
+  2835	
+  2836	    curl_easy_setopt(
+  2837	        curl,
+  2838	        CURLOPT_SSL_VERIFYHOST,
+  2839	        2L
+  2840	    );
+  2841	
+  2842	    curl_easy_setopt(
+  2843	        curl,
+  2844	        CURLOPT_USERAGENT,
+  2845	        g_user_agent[0]
+  2846	            ? g_user_agent
+  2847	            : "SwitchDebridDownloader"
+  2848	    );
+  2849	
+  2850	    /*
+  2851	     * Do not consume one of the transfer connections from a
+  2852	     * persistent pool. The real segmented transfer deliberately
+  2853	     * starts four independent TCP connections below.
+  2854	     */
+  2855	    curl_easy_setopt(
+  2856	        curl,
+  2857	        CURLOPT_FRESH_CONNECT,
+  2858	        1L
+  2859	    );
+  2860	
+  2861	    curl_easy_setopt(
+  2862	        curl,
+  2863	        CURLOPT_FORBID_REUSE,
+  2864	        1L
+  2865	    );
+  2866	
+  2867	    CURLcode rc =
+  2868	        curl_easy_perform(
+  2869	            curl
+  2870	        );
+  2871	
+  2872	    long http_status = 0;
+  2873	
+  2874	    curl_easy_getinfo(
+  2875	        curl,
+  2876	        CURLINFO_RESPONSE_CODE,
+  2877	        &http_status
+  2878	    );
+  2879	
+  2880	    curl_easy_cleanup(
+  2881	        curl
+  2882	    );
+  2883	
+  2884	    return
+  2885	        rc == CURLE_OK &&
+  2886	        http_status == 206 &&
+  2887	        probe.received == 1;
+  2888	}
+  2889	
+  2890	
+  2891	static size_t segment_file_write_callback(
+  2892	    char *ptr,
+  2893	    size_t size,
+  2894	    size_t nmemb,
+  2895	    void *userdata
+  2896	)
+  2897	{
+  2898	    SegmentDownloadContext *ctx =
+  2899	        (SegmentDownloadContext *)userdata;
+  2900	
+  2901	    size_t bytes =
+  2902	        size * nmemb;
+  2903	
+  2904	    return
+  2905	        buffered_file_write(
+  2906	            ctx->file,
+  2907	            ctx->io_buffer,
+  2908	            &ctx->io_used,
+  2909	            ctx->io_capacity,
+  2910	            &ctx->io_failed,
+  2911	            ptr,
+  2912	            bytes
+  2913	        );
+  2914	}
+  2915	
+  2916	
+  2917	static int segment_progress_callback(
+  2918	    void *clientp,
+  2919	    curl_off_t dltotal,
+  2920	    curl_off_t dlnow,
+  2921	    curl_off_t ultotal,
+  2922	    curl_off_t ulnow
+  2923	)
+  2924	{
+  2925	    (void)dltotal;
+  2926	    (void)ultotal;
+  2927	    (void)ulnow;
+  2928	
+  2929	    SegmentDownloadContext *ctx =
+  2930	        (SegmentDownloadContext *)clientp;
+  2931	
+  2932	    SegmentedDownloadState *state =
+  2933	        ctx->state;
+  2934	
+  2935	    state->segment_downloaded[
+  2936	        ctx->segment_index
+  2937	    ] =
+  2938	        dlnow >= 0
+  2939	            ? (unsigned long long)dlnow
+  2940	            : 0;
+  2941	
+  2942	    unsigned long long aggregate = 0;
+  2943	
+  2944	    for (
+  2945	        int i = 0;
+  2946	        i < DOWNLOAD_SEGMENTS;
+  2947	        i++
+  2948	    ) {
+  2949	        aggregate +=
+  2950	            state->segment_downloaded[i];
+  2951	    }
+  2952	
+  2953	    struct timespec now;
+  2954	
+  2955	    clock_gettime(
+  2956	        CLOCK_MONOTONIC,
+  2957	        &now
+  2958	    );
+  2959	
+  2960	    mutexLock(
+  2961	        &g_mutex
+  2962	    );
+  2963	
+  2964	    WorkerProgress *wp =
+  2965	        &g_worker_progress[
+  2966	            state->worker_index
+  2967	        ];
+  2968	
+  2969	    wp->downloaded =
+  2970	        aggregate;
+  2971	
+  2972	    wp->total =
+  2973	        state->total;
+  2974	
+  2975	    if (
+  2976	        wp->last_time.tv_sec != 0 ||
+  2977	        wp->last_time.tv_nsec != 0
+  2978	    ) {
+  2979	        double elapsed =
+  2980	            (double)(
+  2981	                now.tv_sec -
+  2982	                wp->last_time.tv_sec
+  2983	            ) +
+  2984	            (double)(
+  2985	                now.tv_nsec -
+  2986	                wp->last_time.tv_nsec
+  2987	            ) /
+  2988	            1000000000.0;
+  2989	
+  2990	        if (elapsed >= 0.5) {
+  2991	            unsigned long long delta =
+  2992	                aggregate >= wp->last_downloaded
+  2993	                    ? aggregate - wp->last_downloaded
+  2994	                    : 0;
+  2995	
+  2996	            wp->bytes_per_second =
+  2997	                (unsigned long long)(
+  2998	                    (double)delta /
+  2999	                    elapsed
+  3000	                );
+  3001	
+  3002	            wp->last_downloaded =
+  3003	                aggregate;
+  3004	
+  3005	            wp->last_time =
+  3006	                now;
+  3007	        }
+  3008	    }
+  3009	    else {
+  3010	        wp->last_downloaded =
+  3011	            aggregate;
+  3012	
+  3013	        wp->last_time =
+  3014	            now;
+  3015	    }
+  3016	
+  3017	    mutexUnlock(
+  3018	        &g_mutex
+  3019	    );
+  3020	
+  3021	    return
+  3022	        g_running
+  3023	            ? 0
+  3024	            : 1;
+  3025	}
+  3026	
+  3027	
+  3028	static void remove_segment_files(
+  3029	    char paths[DOWNLOAD_SEGMENTS][2144]
+  3030	)
+  3031	{
+  3032	    for (
+  3033	        int i = 0;
+  3034	        i < DOWNLOAD_SEGMENTS;
+  3035	        i++
+  3036	    ) {
+  3037	        if (paths[i][0]) {
+  3038	            remove(
+  3039	                paths[i]
+  3040	            );
+  3041	        }
+  3042	    }
+  3043	}
+  3044	
+  3045	
+  3046	static bool combine_segment_files(
+  3047	    char paths[DOWNLOAD_SEGMENTS][2144],
+  3048	    const char *part_path,
+  3049	    char *error,
+  3050	    size_t error_size
+  3051	)
+  3052	{
+  3053	    FILE *out =
+  3054	        fopen(
+  3055	            part_path,
+  3056	            "wb"
+  3057	        );
+  3058	
+  3059	    if (!out) {
+  3060	        snprintf(
+  3061	            error,
+  3062	            error_size,
+  3063	            "Could not create combined .part file"
+  3064	        );
+  3065	
+  3066	        return false;
+  3067	    }
+  3068	
+  3069	    const size_t buffer_size =
+  3070	        DOWNLOAD_IO_BUFFER_SIZE;
+  3071	
+  3072	    unsigned char *buffer =
+  3073	        malloc(
+  3074	            buffer_size
+  3075	        );
+  3076	
+  3077	    if (!buffer) {
+  3078	        fclose(out);
+  3079	        remove(part_path);
+  3080	
+  3081	        snprintf(
+  3082	            error,
+  3083	            error_size,
+  3084	            "Out of memory while combining segments"
+  3085	        );
+  3086	
+  3087	        return false;
+  3088	    }
+  3089	
+  3090	    bool ok = true;
+  3091	
+  3092	    for (
+  3093	        int i = 0;
+  3094	        i < DOWNLOAD_SEGMENTS && ok;
+  3095	        i++
+  3096	    ) {
+  3097	        FILE *in =
+  3098	            fopen(
+  3099	                paths[i],
+  3100	                "rb"
+  3101	            );
+  3102	
+  3103	        if (!in) {
+  3104	            ok = false;
+  3105	            break;
+  3106	        }
+  3107	
+  3108	        while (ok) {
+  3109	            size_t got =
+  3110	                fread(
+  3111	                    buffer,
+  3112	                    1,
+  3113	                    buffer_size,
+  3114	                    in
+  3115	                );
+  3116	
+  3117	            if (got > 0) {
+  3118	                if (
+  3119	                    fwrite(
+  3120	                        buffer,
+  3121	                        1,
+  3122	                        got,
+  3123	                        out
+  3124	                    ) != got
+  3125	                ) {
+  3126	                    ok = false;
+  3127	                    break;
+  3128	                }
+  3129	            }
+  3130	
+  3131	            if (got < buffer_size) {
+  3132	                if (ferror(in))
+  3133	                    ok = false;
+  3134	
+  3135	                break;
+  3136	            }
+  3137	        }
+  3138	
+  3139	        fclose(in);
+  3140	    }
+  3141	
+  3142	    free(buffer);
+  3143	
+  3144	    if (fclose(out) != 0)
+  3145	        ok = false;
+  3146	
+  3147	    if (!ok) {
+  3148	        remove(part_path);
+  3149	
+  3150	        snprintf(
+  3151	            error,
+  3152	            error_size,
+  3153	            "Could not combine downloaded segments"
+  3154	        );
+  3155	
+  3156	        return false;
+  3157	    }
+  3158	
+  3159	    return true;
+  3160	}
+  3161	
+  3162	
+  3163	static bool download_file_single(
+  3164	    int worker_index,
+  3165	    const UnlockResult *unlock,
+  3166	    const char *part_path,
+  3167	    const char *final_path,
+  3168	    char *error,
+  3169	    size_t error_size
+  3170	)
+  3171	{
+  3172	    remove(
+  3173	        part_path
+  3174	    );
+  3175	
+  3176	    FILE *file =
+  3177	        fopen(
+  3178	            part_path,
+  3179	            "wb"
+  3180	        );
+  3181	
+  3182	    if (!file) {
+  3183	        snprintf(
+  3184	            error,
+  3185	            error_size,
+  3186	            "Could not create output file"
+  3187	        );
+  3188	
+  3189	        return false;
+  3190	    }
+  3191	
+  3192	    CURL *curl =
+  3193	        curl_easy_init();
+  3194	
+  3195	    if (!curl) {
+  3196	        fclose(file);
+  3197	        remove(part_path);
+  3198	
+  3199	        snprintf(
+  3200	            error,
+  3201	            error_size,
+  3202	            "curl_easy_init failed"
+  3203	        );
+  3204	
+  3205	        return false;
+  3206	    }
+  3207	
+  3208	    AsyncWriter writer;
+  3209	
+  3210	    memset(
+  3211	        &writer,
+  3212	        0,
+  3213	        sizeof(writer)
+  3214	    );
+  3215	
+  3216	    DownloadContext ctx = {
+  3217	        .file = file,
+  3218	        .async_writer = &writer,
+  3219	        .worker_index =
+  3220	            worker_index,
+  3221	
+  3222	        .io_buffer = NULL,
+  3223	        .io_used = 0,
+  3224	        .io_capacity =
+  3225	            DOWNLOAD_IO_BUFFER_SIZE,
+  3226	        .io_failed = false
+  3227	    };
+  3228	
+  3229	    ctx.io_buffer =
+  3230	        malloc(
+  3231	            ctx.io_capacity
+  3232	        );
+  3233	
+  3234	    if (!ctx.io_buffer) {
+  3235	        curl_easy_cleanup(
+  3236	            curl
+  3237	        );
+  3238	
+  3239	        fclose(
+  3240	            file
+  3241	        );
+  3242	
+  3243	        remove(
+  3244	            part_path
+  3245	        );
+  3246	
+  3247	        snprintf(
+  3248	            error,
+  3249	            error_size,
+  3250	            "Could not allocate 1 MiB staging buffer"
+  3251	        );
+  3252	
+  3253	        return false;
+  3254	    }
+  3255	
+  3256	    if (
+  3257	        !async_writer_start(
+  3258	            &writer,
+  3259	            file,
+  3260	            error,
+  3261	            error_size
+  3262	        )
+  3263	    ) {
+  3264	        free(
+  3265	            ctx.io_buffer
+  3266	        );
+  3267	
+  3268	        ctx.io_buffer = NULL;
+  3269	
+  3270	        curl_easy_cleanup(
+  3271	            curl
+  3272	        );
+  3273	
+  3274	        fclose(
+  3275	            file
+  3276	        );
+  3277	
+  3278	        remove(
+  3279	            part_path
+  3280	        );
+  3281	
+  3282	        return false;
+  3283	    }
+  3284	
+  3285	    curl_easy_setopt(
+  3286	        curl,
+  3287	        CURLOPT_URL,
+  3288	        unlock->direct_url
+  3289	    );
+  3290	    curl_easy_setopt(
+  3291	        curl,
+  3292	        CURLOPT_HTTP_VERSION,
+  3293	        CURL_HTTP_VERSION_1_1
+  3294	    );
+  3295	
+  3296	    curl_easy_setopt(
+  3297	        curl,
+  3298	        CURLOPT_FOLLOWLOCATION,
+  3299	        1L
+  3300	    );
+  3301	
+  3302	    curl_easy_setopt(
+  3303	        curl,
+  3304	        CURLOPT_MAXREDIRS,
+  3305	        10L
+  3306	    );
+  3307	
+  3308	    curl_easy_setopt(
+  3309	        curl,
+  3310	        CURLOPT_WRITEFUNCTION,
+  3311	        file_write_callback
+  3312	    );
+  3313	
+  3314	    curl_easy_setopt(
+  3315	        curl,
+  3316	        CURLOPT_WRITEDATA,
+  3317	        &ctx
+  3318	    );
+  3319	    
+  3320	    curl_easy_setopt(
+  3321	        curl,
+  3322	        CURLOPT_BUFFERSIZE,
+  3323	        CURL_RECV_BUFFER_SIZE
+  3324	    );
+  3325	
+  3326	    curl_easy_setopt(
+  3327	        curl,
+  3328	        CURLOPT_XFERINFOFUNCTION,
+  3329	        progress_callback
+  3330	    );
+  3331	
+  3332	    curl_easy_setopt(
+  3333	        curl,
+  3334	        CURLOPT_XFERINFODATA,
+  3335	        &ctx
+  3336	    );
+  3337	
+  3338	    curl_easy_setopt(
+  3339	        curl,
+  3340	        CURLOPT_NOPROGRESS,
+  3341	        0L
+  3342	    );
+  3343	
+  3344	    curl_easy_setopt(
+  3345	        curl,
+  3346	        CURLOPT_CONNECTTIMEOUT,
+  3347	        30L
+  3348	    );
+  3349	
+  3350	    curl_easy_setopt(
+  3351	        curl,
+  3352	        CURLOPT_TIMEOUT,
+  3353	        0L
+  3354	    );
+  3355	
+  3356	    curl_easy_setopt(
+  3357	        curl,
+  3358	        CURLOPT_LOW_SPEED_LIMIT,
+  3359	        1024L
+  3360	    );
+  3361	
+  3362	    curl_easy_setopt(
+  3363	        curl,
+  3364	        CURLOPT_LOW_SPEED_TIME,
+  3365	        90L
+  3366	    );
+  3367	
+  3368	    curl_easy_setopt(
+  3369	        curl,
+  3370	        CURLOPT_NOSIGNAL,
+  3371	        1L
+  3372	    );
+  3373	
+  3374	    curl_easy_setopt(
+  3375	        curl,
+  3376	        CURLOPT_SSL_VERIFYPEER,
+  3377	        1L
+  3378	    );
+  3379	
+  3380	    curl_easy_setopt(
+  3381	        curl,
+  3382	        CURLOPT_SSL_VERIFYHOST,
+  3383	        2L
+  3384	    );
+  3385	
+  3386	    curl_easy_setopt(
+  3387	        curl,
+  3388	        CURLOPT_FAILONERROR,
+  3389	        1L
+  3390	    );
+  3391	
+  3392	    curl_easy_setopt(
+  3393	        curl,
+  3394	        CURLOPT_USERAGENT,
+  3395	        g_user_agent[0]
+  3396	            ? g_user_agent
+  3397	            : "SwitchDebridDownloader"
+  3398	    );
+  3399	
+  3400	    CURLcode rc =
+  3401	        curl_easy_perform(
+  3402	            curl
+  3403	        );
+  3404	
+  3405	    long http_status = 0;
+  3406	
+  3407	    curl_easy_getinfo(
+  3408	        curl,
+  3409	        CURLINFO_RESPONSE_CODE,
+  3410	        &http_status
+  3411	    );
+  3412	
+  3413	    bool io_ok =
+  3414	        !ctx.io_failed;
+  3415	
+  3416	    /*
+  3417	     * Send the final partial 1 MiB block to the
+  3418	     * asynchronous writer.
+  3419	     */
+  3420	    if (
+  3421	        io_ok &&
+  3422	        ctx.io_used > 0
+  3423	    ) {
+  3424	        size_t queued =
+  3425	            async_writer_enqueue(
+  3426	                &writer,
+  3427	                (const char *)
+  3428	                    ctx.io_buffer,
+  3429	                ctx.io_used
+  3430	            );
+  3431	
+  3432	        if (
+  3433	            queued !=
+  3434	            ctx.io_used
+  3435	        ) {
+  3436	            io_ok = false;
+  3437	        }
+  3438	
+  3439	        ctx.io_used = 0;
+  3440	    }
+  3441	
+  3442	    bool writer_ok =
+  3443	        async_writer_finish(
+  3444	            &writer
+  3445	        );
+  3446	
+  3447	    io_ok =
+  3448	        io_ok &&
+  3449	        writer_ok;
+  3450	
+  3451	    free(
+  3452	        ctx.io_buffer
+  3453	    );
+  3454	
+  3455	    ctx.io_buffer = NULL;
+  3456	    ctx.async_writer = NULL;
+  3457	
+  3458	    curl_easy_cleanup(
+  3459	        curl
+  3460	    );
+  3461	
+  3462	    if (
+  3463	        fclose(
+  3464	            file
+  3465	        ) != 0
+  3466	    ) {
+  3467	        io_ok = false;
+  3468	    }
+  3469	
+  3470	    if (
+  3471	        rc != CURLE_OK ||
+  3472	        !io_ok ||
+  3473	        (
+  3474	            http_status != 200 &&
+  3475	            http_status != 206
+  3476	        )
+  3477	    ) {
+  3478	        snprintf(
+  3479	            error,
+  3480	            error_size,
+  3481	            "Download failed: curl=%d HTTP=%ld",
+  3482	            (int)rc,
+  3483	            http_status
+  3484	        );
+  3485	
+  3486	        return false;
+  3487	    }
+  3488	
+  3489	    if (
+  3490	        rename(
+  3491	            part_path,
+  3492	            final_path
+  3493	        ) != 0
+  3494	    ) {
+  3495	        snprintf(
+  3496	            error,
+  3497	            error_size,
+  3498	            "Could not finalize downloaded file"
+  3499	        );
+  3500	
+  3501	        return false;
+  3502	    }
+  3503	
+  3504	    if (
+  3505	        !archive_extract_if_needed(
+  3506	            final_path,
+  3507	            error,
+  3508	            error_size
+  3509	        )
+  3510	    ) {
+  3511	        return false;
+  3512	    }
+  3513	
+  3514	    return true;
+  3515	}
+  3516	
+  3517	
+  3518	
+  3519	typedef struct {
+  3520	    unsigned long long total_size;
+  4160	            CURLOPT_SSL_VERIFYPEER,
+  4161	            1L
+  4162	        );
+  4163	
+  4164	        curl_easy_setopt(
+  4165	            easy[i],
+  4166	            CURLOPT_SSL_VERIFYHOST,
+  4167	            2L
+  4168	        );
+  4169	
+  4170	        curl_easy_setopt(
+  4171	            easy[i],
+  4172	            CURLOPT_FAILONERROR,
+  4173	            1L
+  4174	        );
+  4175	
+  4176	        /*
+  4177	         * The speed tests showed four connections are stable,
+  4178	         * while attempts beyond that hit the Switch-side limit.
+  4179	         * Force one independent TCP connection per segment.
+  4180	         */
+  4181	
+  4182	        curl_easy_setopt(
+  4183	            easy[i],
+  4184	            CURLOPT_USERAGENT,
+  4185	            g_user_agent[0]
+  4186	                ? g_user_agent
+  4187	                : "SwitchDebridDownloader"
+  4188	        );
+  4189	
+  4190	        CURLMcode add_rc =
+  4191	            curl_multi_add_handle(
+  4192	                multi,
+  4193	                easy[i]
+  4194	            );
+  4195	
+  4196	        if (add_rc != CURLM_OK) {
+  4197	            setup_ok = false;
+  4198	            break;
+  4199	        }
+  4200	    }
+  4201	
+  4202	    CURLMcode mrc =
+  4203	        CURLM_OK;
+  4204	
+  4205	    if (setup_ok) {
+  4206	        int running = 0;
+  4207	
+  4208	        mrc =
+  4209	            curl_multi_perform(
+  4210	                multi,
+  4211	                &running
+  4212	            );
+  4213	
+  4214	        while (
+  4215	            mrc == CURLM_OK &&
+  4216	            running > 0
+  4217	        ) {
+  4218	            int numfds = 0;
+  4219	
+  4220	            mrc =
+  4221	                curl_multi_wait(
+  4222	                    multi,
+  4223	                    NULL,
+  4224	                    0,
+  4225	                    1000,
+  4226	                    &numfds
+  4227	                );
+  4228	
+  4229	            if (mrc != CURLM_OK)
+  4230	                break;
+  4231	
+  4232	            mrc =
+  4233	                curl_multi_perform(
+  4234	                    multi,
+  4235	                    &running
+  4236	                );
+  4237	        }
+  4238	    }
+  4239	
+  4240	    int messages_left = 0;
+  4241	    CURLMsg *message = NULL;
+  4242	
+  4243	    while (
+  4244	        (
+  4245	            message =
+  4246	                curl_multi_info_read(
+  4247	                    multi,
+  4248	                    &messages_left
+  4249	                )
+  4250	        ) != NULL
+  4251	    ) {
+  4252	        if (
+  4253	            message->msg !=
+  4254	            CURLMSG_DONE
+  4255	        ) {
+  4256	            continue;
+  4257	        }
+  4258	
+  4259	        for (
+  4260	            int i = 0;
+  4261	            i < DOWNLOAD_SEGMENTS;
+  4262	            i++
+  4263	        ) {
+  4264	            if (
+  4265	                easy[i] ==
+  4266	                message->easy_handle
+  4267	            ) {
+  4268	                results[i] =
+  4269	                    message->data.result;
+  4270	
+  4271	                break;
+  4272	            }
+  4273	        }
+  4274	    }
+  4275	
+  4276	    bool success =
+  4277	        setup_ok &&
+  4278	        mrc == CURLM_OK;
+  4279	
+  4280	    for (
+  4281	        int i = 0;
+  4282	        i < DOWNLOAD_SEGMENTS;
+  4283	        i++
+  4284	    ) {
+  4285	        if (easy[i]) {
+  4286	            curl_easy_getinfo(
+  4287	                easy[i],
+  4288	                CURLINFO_RESPONSE_CODE,
+  4289	                &http_status[i]
+  4290	            );
+  4291	        }
+  4292	
+  4293	        if (contexts[i].io_buffer) {
+  4294	            if (
+  4295	                success &&
+  4296	                (
+  4297	                    contexts[i].io_failed ||
+  4298	                    !buffered_file_flush(
+  4299	                        contexts[i].file,
+  4300	                        contexts[i].io_buffer,
+  4301	                        &contexts[i].io_used,
+  4302	                        &contexts[i].io_failed
+  4303	                    )
+  4304	                )
+  4305	            ) {
+  4306	                success = false;
+  4307	            }
+  4308	
+  4309	            free(
+  4310	                contexts[i].io_buffer
+  4311	            );
+  4312	
+  4313	            contexts[i].io_buffer = NULL;
+  4314	        }
+  4315	
+  4316	        if (files[i]) {
+  4317	            if (
+  4318	                fclose(
+  4319	                    files[i]
+  4320	                ) != 0
+  4321	            ) {
+  4322	                success = false;
+  4323	            }
+  4324	
+  4325	            files[i] = NULL;
+  4326	        }
+  4327	
+  4328	        if (easy[i]) {
+  4329	            curl_multi_remove_handle(
+  4330	                multi,
+  4331	                easy[i]
+  4332	            );
+  4333	
+  4334	            curl_easy_cleanup(
+  4335	                easy[i]
+  4336	            );
+  4337	
+  4338	            easy[i] = NULL;
+  4339	        }
+  4340	    }
+  4341	
+  4342	    curl_multi_cleanup(
+  4343	        multi
+  4344	    );
+  4345	
+  4346	    for (
+  4347	        int i = 0;
+  4348	        i < DOWNLOAD_SEGMENTS;
+  4349	        i++
+  4350	    ) {
+  4351	        struct stat st;
+  4352	
+  4353	        if (
+  4354	            results[i] != CURLE_OK ||
+  4355	            http_status[i] != 206 ||
+  4356	            stat(
+  4357	                segment_paths[i],
+  4358	                &st
+  4359	            ) != 0 ||
+  4360	            (unsigned long long)st.st_size !=
+  4361	                expected[i]
+  4362	        ) {
+  4363	            success = false;
+  4364	
+  4365	            if (!error[0]) {
+  4366	                snprintf(
+  4367	                    error,
+  4368	                    error_size,
+  4369	                    "Segment %d failed: curl=%d HTTP=%ld",
+  4370	                    i + 1,
+  4371	                    (int)results[i],
+  4372	                    http_status[i]
+  4373	                );
+  4374	            }
+  4375	        }
+  4376	    }
+  4377	
+  4378	    if (
+  4379	        success &&
+  4380	        !combine_segment_files(
+  4381	            segment_paths,
+  4382	            part_path,
+  4383	            error,
+  4384	            error_size
+  4385	        )
+  4386	    ) {
+  4387	        success = false;
+  4388	    }
+  4389	
+  4390	    remove_segment_files(
+  4391	        segment_paths
+  4392	    );
+  4393	
+  4394	    if (!success) {
+  4395	        remove(
+  4396	            part_path
+  4397	        );
+  4398	
+  4399	        if (!error[0]) {
+  4400	            snprintf(
+  4401	                error,
+  4402	                error_size,
+  4403	                "Segmented download failed"
+  4404	            );
+  4405	        }
+  4406	
+  4407	        return false;
+  4408	    }
+  4409	
+  4410	    if (
+  4411	        rename(
+  4412	            part_path,
+  4413	            final_path
+  4414	        ) != 0
+  4415	    ) {
+  4416	        remove(
+  4417	            part_path
+  4418	        );
+  4419	
+  4420	        snprintf(

@@ -1,0 +1,34 @@
+#pragma once
+
+#include <stdbool.h>
+
+typedef struct {
+    int queued;
+    int active;
+    int completed;
+    int failed;
+
+    unsigned long long current_downloaded;
+    unsigned long long current_total;
+    unsigned long long current_bytes_per_second;
+} DownloaderStats;
+
+bool downloader_init(
+    const char *token,
+    const char *user_agent,
+    int max_concurrent
+);
+
+void downloader_shutdown(void);
+
+void downloader_set_token(
+    const char *token
+);
+
+bool downloader_enqueue(
+    const char *url
+);
+
+void downloader_get_stats(
+    DownloaderStats *stats
+);

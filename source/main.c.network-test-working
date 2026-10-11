@@ -1,0 +1,178 @@
+#include <switch.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#define PORT 8090
+
+static void wait_for_plus(PadState *pad)
+{
+    while (appletMainLoop()) {
+        padUpdate(pad);
+
+        if (
+            padGetButtonsDown(pad) &
+            HidNpadButton_Plus
+        ) {
+            break;
+        }
+
+        consoleUpdate(NULL);
+        svcSleepThread(50 * 1000 * 1000LL);
+    }
+}
+
+int main(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    consoleInit(NULL);
+
+    padConfigureInput(
+        1,
+        HidNpadStyleSet_NpadStandard
+    );
+
+    PadState pad;
+    padInitializeDefault(&pad);
+
+    printf("Switch Debrid Downloader\n");
+    printf("Network diagnostic\n\n");
+    printf("1. NRO startup: OK\n");
+
+    consoleUpdate(NULL);
+
+    Result rc = socketInitializeDefault();
+
+    if (R_FAILED(rc)) {
+        printf(
+            "2. socketInitializeDefault: FAILED\n"
+            "Result: 0x%08X\n\n"
+            "Press + to exit.\n",
+            rc
+        );
+
+        consoleUpdate(NULL);
+        wait_for_plus(&pad);
+
+        consoleExit(NULL);
+        return 0;
+    }
+
+    printf("2. socketInitializeDefault: OK\n");
+    consoleUpdate(NULL);
+
+    int server = socket(
+        AF_INET,
+        SOCK_STREAM,
+        0
+    );
+
+    if (server < 0) {
+        printf(
+            "3. socket(): FAILED\n"
+            "errno: %d\n\n"
+            "Press + to exit.\n",
+            errno
+        );
+
+        consoleUpdate(NULL);
+        wait_for_plus(&pad);
+
+        socketExit();
+        consoleExit(NULL);
+        return 0;
+    }
+
+    printf("3. socket(): OK\n");
+    consoleUpdate(NULL);
+
+    int yes = 1;
+
+    setsockopt(
+        server,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &yes,
+        sizeof(yes)
+    );
+
+    struct sockaddr_in addr;
+
+    memset(
+        &addr,
+        0,
+        sizeof(addr)
+    );
+
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (
+        bind(
+            server,
+            (struct sockaddr *)&addr,
+            sizeof(addr)
+        ) != 0
+    ) {
+        printf(
+            "4. bind(): FAILED\n"
+            "errno: %d\n\n"
+            "Press + to exit.\n",
+            errno
+        );
+
+        consoleUpdate(NULL);
+        wait_for_plus(&pad);
+
+        close(server);
+        socketExit();
+        consoleExit(NULL);
+        return 0;
+    }
+
+    printf("4. bind(): OK\n");
+    consoleUpdate(NULL);
+
+    if (
+        listen(
+            server,
+            8
+        ) != 0
+    ) {
+        printf(
+            "5. listen(): FAILED\n"
+            "errno: %d\n\n"
+            "Press + to exit.\n",
+            errno
+        );
+
+        consoleUpdate(NULL);
+        wait_for_plus(&pad);
+
+        close(server);
+        socketExit();
+        consoleExit(NULL);
+        return 0;
+    }
+
+    printf("5. listen(): OK\n\n");
+    printf("NETWORK SERVER READY on port %d\n\n", PORT);
+    printf("Press + to exit.\n");
+
+    consoleUpdate(NULL);
+
+    wait_for_plus(&pad);
+
+    close(server);
+    socketExit();
+    consoleExit(NULL);
+
+    return 0;
+}

@@ -1,0 +1,896 @@
+#include <switch.h>
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define PORT 8090
+#define REQUEST_MAX 32768
+
+#define CONFIG_DIR \
+    "sdmc:/config/SwitchDebridDownloader"
+
+#define INBOX_FILE \
+    "sdmc:/config/SwitchDebridDownloader/inbox.tsv"
+
+
+static int send_all(
+    int fd,
+    const void *buffer,
+    size_t length
+)
+{
+    const char *p =
+        (const char *)buffer;
+
+    while (length > 0) {
+        ssize_t n =
+            send(
+                fd,
+                p,
+                length,
+                0
+            );
+
+        if (n <= 0)
+            return -1;
+
+        p += n;
+        length -= (size_t)n;
+    }
+
+    return 0;
+}
+
+
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+
+    return -1;
+}
+
+
+static void url_decode(
+    char *dst,
+    size_t dst_size,
+    const char *src
+)
+{
+    size_t out = 0;
+
+    while (
+        *src &&
+        out + 1 < dst_size
+    ) {
+        if (
+            src[0] == '%' &&
+            src[1] &&
+            src[2]
+        ) {
+            int hi =
+                hex_value(src[1]);
+
+            int lo =
+                hex_value(src[2]);
+
+            if (
+                hi >= 0 &&
+                lo >= 0
+            ) {
+                dst[out++] =
+                    (char)(
+                        (hi << 4) |
+                        lo
+                    );
+
+                src += 3;
+                continue;
+            }
+        }
+
+        if (*src == '+') {
+            dst[out++] = ' ';
+        }
+        else {
+            dst[out++] = *src;
+        }
+
+        src++;
+    }
+
+    dst[out] = '\0';
+}
+
+
+static bool form_value(
+    const char *body,
+    const char *name,
+    char *output,
+    size_t output_size
+)
+{
+    char needle[128];
+
+    snprintf(
+        needle,
+        sizeof(needle),
+        "%s=",
+        name
+    );
+
+    size_t needle_len =
+        strlen(needle);
+
+    const char *p = body;
+
+    while (*p) {
+        if (
+            (
+                p == body ||
+                p[-1] == '&'
+            ) &&
+            strncmp(
+                p,
+                needle,
+                needle_len
+            ) == 0
+        ) {
+            p += needle_len;
+
+            const char *end =
+                strchr(
+                    p,
+                    '&'
+                );
+
+            size_t length =
+                end
+                    ? (size_t)(end - p)
+                    : strlen(p);
+
+            char encoded[16384];
+
+            if (
+                length >=
+                sizeof(encoded)
+            ) {
+                length =
+                    sizeof(encoded) - 1;
+            }
+
+            memcpy(
+                encoded,
+                p,
+                length
+            );
+
+            encoded[length] =
+                '\0';
+
+            url_decode(
+                output,
+                output_size,
+                encoded
+            );
+
+            return true;
+        }
+
+        p =
+            strchr(
+                p,
+                '&'
+            );
+
+        if (!p)
+            break;
+
+        p++;
+    }
+
+    return false;
+}
+
+
+static void sanitize_field(char *text)
+{
+    while (*text) {
+        if (
+            *text == '\r' ||
+            *text == '\n' ||
+            *text == '\t'
+        ) {
+            *text = ' ';
+        }
+
+        text++;
+    }
+}
+
+
+static void send_page(
+    int fd,
+    const char *message
+)
+{
+    char body[8192];
+
+    int body_len =
+        snprintf(
+            body,
+            sizeof(body),
+            "<!doctype html>"
+            "<html>"
+            "<head>"
+            "<meta name='viewport' "
+            "content='width=device-width,initial-scale=1'>"
+            "<title>Switch Debrid Downloader</title>"
+            "</head>"
+
+            "<body style='font-family:sans-serif;"
+            "max-width:650px;margin:30px auto;padding:16px'>"
+
+            "<h2>Switch Debrid Downloader</h2>"
+
+            "<p>%s</p>"
+
+            "<form method='POST' action='/submit'>"
+
+            "<label>Provider</label><br>"
+            "<select name='provider' "
+            "style='width:100%%;padding:10px'>"
+            "<option value='torbox'>TorBox</option>"
+            "<option value='alldebrid'>AllDebrid</option>"
+            "</select>"
+
+            "<br><br>"
+
+            "<label>Link / Magnet</label><br>"
+            "<textarea name='link' rows='5' "
+            "style='width:100%%'></textarea>"
+
+            "<br><br>"
+
+            "<label>Bundle name</label><br>"
+            "<input name='bundle' "
+            "style='width:100%%;padding:10px' "
+            "placeholder='Mario Kart 8 Deluxe'>"
+
+            "<br><br>"
+
+            "<label>Manual type</label><br>"
+            "<select name='type' "
+            "style='width:100%%;padding:10px'>"
+            "<option value='base'>Base</option>"
+            "<option value='update'>Update</option>"
+            "<option value='dlc'>DLC</option>"
+            "</select>"
+
+            "<br><br>"
+
+            "<button type='submit' "
+            "style='padding:12px 24px'>"
+            "Send to Switch"
+            "</button>"
+
+            "</form>"
+            "</body>"
+            "</html>",
+            message ? message : ""
+        );
+
+    if (
+        body_len < 0 ||
+        body_len >=
+            (int)sizeof(body)
+    ) {
+        return;
+    }
+
+    char header[512];
+
+    int header_len =
+        snprintf(
+            header,
+            sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            body_len
+        );
+
+    send_all(
+        fd,
+        header,
+        (size_t)header_len
+    );
+
+    send_all(
+        fd,
+        body,
+        (size_t)body_len
+    );
+}
+
+
+static bool save_submission(
+    const char *provider,
+    const char *bundle,
+    const char *type,
+    const char *link
+)
+{
+    mkdir(
+        "sdmc:/config",
+        0777
+    );
+
+    mkdir(
+        CONFIG_DIR,
+        0777
+    );
+
+    FILE *f =
+        fopen(
+            INBOX_FILE,
+            "a"
+        );
+
+    if (!f)
+        return false;
+
+    fprintf(
+        f,
+        "%s\t%s\t%s\t%s\n",
+        provider,
+        bundle,
+        type,
+        link
+    );
+
+    fclose(f);
+
+    return true;
+}
+
+
+
+static const char *find_ci(
+    const char *haystack,
+    const char *needle
+)
+{
+    size_t needle_len =
+        strlen(needle);
+
+    if (!needle_len)
+        return haystack;
+
+    for (
+        const char *p = haystack;
+        *p;
+        p++
+    ) {
+        if (
+            strncasecmp(
+                p,
+                needle,
+                needle_len
+            ) == 0
+        ) {
+            return p;
+        }
+    }
+
+    return NULL;
+}
+
+
+static ssize_t read_http_request(
+    int fd,
+    char *buffer,
+    size_t buffer_size
+)
+{
+    size_t used = 0;
+    size_t expected_total = 0;
+
+    while (
+        used + 1 <
+        buffer_size
+    ) {
+        ssize_t got =
+            recv(
+                fd,
+                buffer + used,
+                buffer_size - used - 1,
+                0
+            );
+
+        if (got <= 0)
+            break;
+
+        used +=
+            (size_t)got;
+
+        buffer[used] =
+            '\0';
+
+        char *body =
+            strstr(
+                buffer,
+                "\r\n\r\n"
+            );
+
+        if (body) {
+            size_t header_size =
+                (size_t)(
+                    body + 4 -
+                    buffer
+                );
+
+            if (
+                expected_total == 0
+            ) {
+                const char *cl =
+                    find_ci(
+                        buffer,
+                        "Content-Length:"
+                    );
+
+                size_t content_length = 0;
+
+                if (
+                    cl &&
+                    cl < body
+                ) {
+                    cl +=
+                        strlen(
+                            "Content-Length:"
+                        );
+
+                    content_length =
+                        (size_t)strtoul(
+                            cl,
+                            NULL,
+                            10
+                        );
+                }
+
+                expected_total =
+                    header_size +
+                    content_length;
+            }
+
+            if (
+                expected_total > 0 &&
+                used >= expected_total
+            ) {
+                break;
+            }
+
+            /*
+             * GET requests normally have no body.
+             */
+            if (
+                strncmp(
+                    buffer,
+                    "GET ",
+                    4
+                ) == 0
+            ) {
+                break;
+            }
+        }
+    }
+
+    buffer[used] = '\0';
+
+    return (ssize_t)used;
+}
+
+
+static void handle_client(int fd)
+{
+    char request[REQUEST_MAX];
+
+    ssize_t got =
+        read_http_request(
+            fd,
+            request,
+            sizeof(request)
+        );
+
+    if (got <= 0)
+        return;
+
+    if (
+        strncmp(
+            request,
+            "GET / ",
+            6
+        ) == 0
+    ) {
+        send_page(
+            fd,
+            "Ready."
+        );
+
+        return;
+    }
+
+    if (
+        strncmp(
+            request,
+            "POST /submit ",
+            13
+        ) == 0
+    ) {
+        char *body =
+            strstr(
+                request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(
+                fd,
+                "Invalid request."
+            );
+
+            return;
+        }
+
+        body += 4;
+
+        char provider[32] = {0};
+        char bundle[256] = {0};
+        char type[32] = {0};
+        char link[16384] = {0};
+
+        form_value(
+            body,
+            "provider",
+            provider,
+            sizeof(provider)
+        );
+
+        form_value(
+            body,
+            "bundle",
+            bundle,
+            sizeof(bundle)
+        );
+
+        form_value(
+            body,
+            "type",
+            type,
+            sizeof(type)
+        );
+
+        form_value(
+            body,
+            "link",
+            link,
+            sizeof(link)
+        );
+
+        sanitize_field(provider);
+        sanitize_field(bundle);
+        sanitize_field(type);
+        sanitize_field(link);
+
+        if (
+            !provider[0] ||
+            !bundle[0] ||
+            !type[0] ||
+            !link[0]
+        ) {
+            send_page(
+                fd,
+                "Please fill every field."
+            );
+
+            return;
+        }
+
+        if (
+            strcmp(provider, "torbox") != 0 &&
+            strcmp(provider, "alldebrid") != 0
+        ) {
+            send_page(
+                fd,
+                "Invalid provider."
+            );
+
+            return;
+        }
+
+        if (
+            strcmp(type, "base") != 0 &&
+            strcmp(type, "update") != 0 &&
+            strcmp(type, "dlc") != 0
+        ) {
+            send_page(
+                fd,
+                "Invalid manual type."
+            );
+
+            return;
+        }
+
+        if (
+            save_submission(
+                provider,
+                bundle,
+                type,
+                link
+            )
+        ) {
+            printf(
+                "\nSubmission received\n"
+                "Provider: %s\n"
+                "Bundle:   %s\n"
+                "Type:     %s\n\n",
+                provider,
+                bundle,
+                type
+            );
+
+            consoleUpdate(NULL);
+
+            send_page(
+                fd,
+                "Saved to Switch inbox."
+            );
+        }
+        else {
+            send_page(
+                fd,
+                "Failed to save submission."
+            );
+        }
+
+        return;
+    }
+
+    static const char not_found[] =
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+
+    send_all(
+        fd,
+        not_found,
+        sizeof(not_found) - 1
+    );
+}
+
+
+int main(
+    int argc,
+    char **argv
+)
+{
+    (void)argc;
+    (void)argv;
+
+    consoleInit(NULL);
+
+    padConfigureInput(
+        1,
+        HidNpadStyleSet_NpadStandard
+    );
+
+    PadState pad;
+    padInitializeDefault(&pad);
+
+    printf(
+        "Switch Debrid Downloader\n"
+        "Stage 1 - Phone Sender\n\n"
+    );
+
+    consoleUpdate(NULL);
+
+    Result rc =
+        socketInitializeDefault();
+
+    if (R_FAILED(rc)) {
+        printf(
+            "socketInitializeDefault failed:\n"
+            "0x%08X\n\n"
+            "Press + to exit.\n",
+            rc
+        );
+
+        consoleUpdate(NULL);
+
+        while (appletMainLoop()) {
+            padUpdate(&pad);
+
+            if (
+                padGetButtonsDown(&pad) &
+                HidNpadButton_Plus
+            ) {
+                break;
+            }
+
+            svcSleepThread(
+                50 * 1000 * 1000LL
+            );
+        }
+
+        consoleExit(NULL);
+        return 1;
+    }
+
+    int server =
+        socket(
+            AF_INET,
+            SOCK_STREAM,
+            0
+        );
+
+    if (server < 0) {
+        printf(
+            "socket() failed: %d\n",
+            errno
+        );
+
+        socketExit();
+        consoleExit(NULL);
+        return 1;
+    }
+
+    int yes = 1;
+
+    setsockopt(
+        server,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &yes,
+        sizeof(yes)
+    );
+
+    struct sockaddr_in addr;
+
+    memset(
+        &addr,
+        0,
+        sizeof(addr)
+    );
+
+    addr.sin_family =
+        AF_INET;
+
+    addr.sin_port =
+        htons(PORT);
+
+    addr.sin_addr.s_addr =
+        INADDR_ANY;
+
+    if (
+        bind(
+            server,
+            (struct sockaddr *)&addr,
+            sizeof(addr)
+        ) != 0
+    ) {
+        printf(
+            "bind() failed: %d\n",
+            errno
+        );
+
+        close(server);
+        socketExit();
+        consoleExit(NULL);
+        return 1;
+    }
+
+    if (
+        listen(
+            server,
+            8
+        ) != 0
+    ) {
+        printf(
+            "listen() failed: %d\n",
+            errno
+        );
+
+        close(server);
+        socketExit();
+        consoleExit(NULL);
+        return 1;
+    }
+
+    printf(
+        "READY\n\n"
+        "Listening on port %d\n\n"
+        "From your phone open:\n"
+        "http://SWITCH-IP:%d\n\n"
+        "Manual grouping only.\n"
+        "Press + to exit.\n",
+        PORT,
+        PORT
+    );
+
+    consoleUpdate(NULL);
+
+    while (appletMainLoop()) {
+        padUpdate(&pad);
+
+        if (
+            padGetButtonsDown(&pad) &
+            HidNpadButton_Plus
+        ) {
+            break;
+        }
+
+        fd_set fds;
+
+        FD_ZERO(&fds);
+        FD_SET(server, &fds);
+
+        struct timeval tv;
+
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
+
+        int ready =
+            select(
+                server + 1,
+                &fds,
+                NULL,
+                NULL,
+                &tv
+            );
+
+        if (
+            ready > 0 &&
+            FD_ISSET(
+                server,
+                &fds
+            )
+        ) {
+            int client =
+                accept(
+                    server,
+                    NULL,
+                    NULL
+                );
+
+            if (client >= 0) {
+                handle_client(client);
+                close(client);
+            }
+        }
+    }
+
+    close(server);
+    socketExit();
+    consoleExit(NULL);
+
+    return 0;
+}

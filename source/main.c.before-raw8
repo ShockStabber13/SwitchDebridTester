@@ -1,0 +1,4423 @@
+#include <switch.h>
+#include <curl/curl.h>
+#include "downloader.h"
+#include "auth.h"
+#include "alldebrid_pin.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define PORT 8090
+
+#define REQUEST_MAX 32768
+#define LINKS_MAX   16384
+#define API_BODY_MAX 65536
+
+#define CONFIG_DIR \
+    "sdmc:/config/SwitchDebridDownloader"
+
+#define CONFIG_FILE \
+    "sdmc:/config/SwitchDebridDownloader/config.ini"
+
+#define PENDING_FILE \
+    "sdmc:/config/SwitchDebridDownloader/pending.txt"
+
+
+static char g_request[REQUEST_MAX];
+static char g_links[LINKS_MAX];
+
+static char g_alldebrid_token[1024];
+static char g_alldebrid_name[128];
+
+static char g_api_body[API_BODY_MAX];
+
+static int g_max_concurrent = 2;
+static unsigned g_last_queued = 0;
+static bool g_alldebrid_connected = false;
+
+
+/* ========================================================= */
+/* Basic helpers                                             */
+/* ========================================================= */
+
+static int send_all(
+    int fd,
+    const void *buffer,
+    size_t length
+)
+{
+    const char *p =
+        (const char *)buffer;
+
+    while (length > 0) {
+        ssize_t n =
+            send(
+                fd,
+                p,
+                length,
+                0
+            );
+
+        if (n <= 0)
+            return -1;
+
+        p += n;
+        length -= (size_t)n;
+    }
+
+    return 0;
+}
+
+
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+
+    return -1;
+}
+
+
+static char *trim(char *s)
+{
+    while (
+        *s == ' ' ||
+        *s == '\t' ||
+        *s == '\r' ||
+        *s == '\n'
+    ) {
+        s++;
+    }
+
+    size_t len =
+        strlen(s);
+
+    while (
+        len > 0 &&
+        (
+            s[len - 1] == ' ' ||
+            s[len - 1] == '\t' ||
+            s[len - 1] == '\r' ||
+            s[len - 1] == '\n'
+        )
+    ) {
+        s[--len] = '\0';
+    }
+
+    return s;
+}
+
+
+static void ensure_config_dir(void)
+{
+    mkdir(
+        "sdmc:/config",
+        0777
+    );
+
+    mkdir(
+        CONFIG_DIR,
+        0777
+    );
+}
+
+
+/* ========================================================= */
+/* Config                                                    */
+/* ========================================================= */
+
+static bool create_default_config(void)
+{
+    ensure_config_dir();
+
+    FILE *f =
+        fopen(
+            CONFIG_FILE,
+            "wb"
+        );
+
+    if (!f)
+        return false;
+
+    static const char config[] =
+        "[downloads]\n"
+        "max_concurrent=2\n";
+
+    bool ok =
+        fwrite(
+            config,
+            1,
+            sizeof(config) - 1,
+            f
+        ) ==
+        sizeof(config) - 1;
+
+    fclose(f);
+
+    return ok;
+}
+
+
+static bool load_config(void)
+{
+    g_alldebrid_token[0] = '\0';
+
+    snprintf(
+        g_alldebrid_name,
+        sizeof(g_alldebrid_name),
+        "SwitchDebridDownloader"
+    );
+
+    g_max_concurrent = 2;
+
+    ensure_config_dir();
+
+    FILE *f =
+        fopen(
+            CONFIG_FILE,
+            "rb"
+        );
+
+    if (!f) {
+        create_default_config();
+        return false;
+    }
+
+    char line[2048];
+    char section[64] = {0};
+
+    while (
+        fgets(
+            line,
+            sizeof(line),
+            f
+        )
+    ) {
+        char *p =
+            trim(line);
+
+        if (
+            !p[0] ||
+            p[0] == '#' ||
+            p[0] == ';'
+        ) {
+            continue;
+        }
+
+        if (p[0] == '[') {
+            char *end =
+                strchr(
+                    p,
+                    ']'
+                );
+
+            if (!end)
+                continue;
+
+            *end = '\0';
+
+            snprintf(
+                section,
+                sizeof(section),
+                "%s",
+                p + 1
+            );
+
+            continue;
+        }
+
+        char *equals =
+            strchr(
+                p,
+                '='
+            );
+
+        if (!equals)
+            continue;
+
+        *equals = '\0';
+
+        char *key =
+            trim(p);
+
+        char *value =
+            trim(
+                equals + 1
+            );
+
+        if (
+            strcasecmp(
+                section,
+                "alldebrid"
+            ) == 0 &&
+            strcasecmp(
+                key,
+                "name"
+            ) == 0
+        ) {
+            snprintf(
+                g_alldebrid_name,
+                sizeof(g_alldebrid_name),
+                "%s",
+                value
+            );
+        }
+        else if (
+            strcasecmp(
+                section,
+                "alldebrid"
+            ) == 0 &&
+            strcasecmp(
+                key,
+                "token"
+            ) == 0
+        ) {
+            snprintf(
+                g_alldebrid_token,
+                sizeof(g_alldebrid_token),
+                "%s",
+                value
+            );
+        }
+        else if (
+            strcasecmp(
+                section,
+                "downloads"
+            ) == 0 &&
+            strcasecmp(
+                key,
+                "max_concurrent"
+            ) == 0
+        ) {
+            int n =
+                atoi(value);
+
+            if (n < 1)
+                n = 1;
+
+            if (n > 8)
+                n = 8;
+
+            g_max_concurrent = n;
+        }
+    }
+
+    fclose(f);
+
+    return true;
+}
+
+
+/* ========================================================= */
+/* Form decoding                                             */
+/* ========================================================= */
+
+static void url_decode(
+    char *dst,
+    size_t dst_size,
+    const char *src,
+    size_t src_len
+)
+{
+    size_t out = 0;
+
+    for (
+        size_t i = 0;
+        i < src_len &&
+        out + 1 < dst_size;
+        i++
+    ) {
+        if (
+            src[i] == '%' &&
+            i + 2 < src_len
+        ) {
+            int hi =
+                hex_value(
+                    src[i + 1]
+                );
+
+            int lo =
+                hex_value(
+                    src[i + 2]
+                );
+
+            if (
+                hi >= 0 &&
+                lo >= 0
+            ) {
+                dst[out++] =
+                    (char)(
+                        (hi << 4) |
+                        lo
+                    );
+
+                i += 2;
+                continue;
+            }
+        }
+
+        if (src[i] == '+')
+            dst[out++] = ' ';
+        else
+            dst[out++] = src[i];
+    }
+
+    dst[out] = '\0';
+}
+
+
+static bool form_value(
+    const char *body,
+    const char *name,
+    char *output,
+    size_t output_size
+)
+{
+    char key[64];
+
+    snprintf(
+        key,
+        sizeof(key),
+        "%s=",
+        name
+    );
+
+    size_t key_len =
+        strlen(key);
+
+    const char *p =
+        body;
+
+    while (*p) {
+        if (
+            (
+                p == body ||
+                p[-1] == '&'
+            ) &&
+            strncmp(
+                p,
+                key,
+                key_len
+            ) == 0
+        ) {
+            p += key_len;
+
+            const char *end =
+                strchr(
+                    p,
+                    '&'
+                );
+
+            size_t len =
+                end
+                    ? (size_t)(end - p)
+                    : strlen(p);
+
+            url_decode(
+                output,
+                output_size,
+                p,
+                len
+            );
+
+            return true;
+        }
+
+        p =
+            strchr(
+                p,
+                '&'
+            );
+
+        if (!p)
+            break;
+
+        p++;
+    }
+
+    output[0] = '\0';
+
+    return false;
+}
+
+
+/* ========================================================= */
+/* Local multi-link queue                                    */
+/* ========================================================= */
+
+static bool append_pending(
+    const char *link
+)
+{
+    return downloader_enqueue(
+        link
+    );
+}
+
+
+static unsigned queue_multiple_links(
+    char *links
+)
+{
+    unsigned count = 0;
+
+    char *p = links;
+
+    while (*p) {
+        char *start = p;
+
+        while (
+            *p &&
+            *p != '\r' &&
+            *p != '\n'
+        ) {
+            p++;
+        }
+
+        char saved = *p;
+        *p = '\0';
+
+        char *line =
+            trim(start);
+
+        if (line[0]) {
+            if (
+                append_pending(
+                    line
+                )
+            ) {
+                count++;
+            }
+        }
+
+        if (!saved)
+            break;
+
+        p++;
+
+        while (
+            *p == '\r' ||
+            *p == '\n'
+        ) {
+            p++;
+        }
+    }
+
+    return count;
+}
+
+
+static bool first_link(
+    char *links,
+    char *output,
+    size_t output_size
+)
+{
+    char *p = links;
+
+    while (*p) {
+        while (
+            *p == '\r' ||
+            *p == '\n' ||
+            *p == ' ' ||
+            *p == '\t'
+        ) {
+            p++;
+        }
+
+        if (!*p)
+            break;
+
+        char *end = p;
+
+        while (
+            *end &&
+            *end != '\r' &&
+            *end != '\n'
+        ) {
+            end++;
+        }
+
+        size_t len =
+            (size_t)(
+                end - p
+            );
+
+        while (
+            len > 0 &&
+            (
+                p[len - 1] == ' ' ||
+                p[len - 1] == '\t'
+            )
+        ) {
+            len--;
+        }
+
+        if (len > 0) {
+            if (
+                len >=
+                output_size
+            ) {
+                len =
+                    output_size - 1;
+            }
+
+            memcpy(
+                output,
+                p,
+                len
+            );
+
+            output[len] = '\0';
+
+            return true;
+        }
+
+        p = end;
+    }
+
+    output[0] = '\0';
+
+    return false;
+}
+
+
+/* ========================================================= */
+/* curl response buffer                                      */
+/* ========================================================= */
+
+typedef struct {
+    char *data;
+    size_t capacity;
+    size_t size;
+    bool overflow;
+} ApiBuffer;
+
+
+static size_t api_write_callback(
+    char *ptr,
+    size_t size,
+    size_t nmemb,
+    void *userdata
+)
+{
+    ApiBuffer *buffer =
+        (ApiBuffer *)userdata;
+
+    size_t amount =
+        size * nmemb;
+
+    if (
+        buffer->size +
+        amount +
+        1 >
+        buffer->capacity
+    ) {
+        buffer->overflow =
+            true;
+
+        return 0;
+    }
+
+    memcpy(
+        buffer->data +
+        buffer->size,
+        ptr,
+        amount
+    );
+
+    buffer->size +=
+        amount;
+
+    buffer->data[
+        buffer->size
+    ] = '\0';
+
+    return amount;
+}
+
+
+/* ========================================================= */
+/* Tiny JSON helpers                                         */
+/* ========================================================= */
+
+static const char *skip_json_space(
+    const char *p
+)
+{
+    while (
+        *p == ' ' ||
+        *p == '\t' ||
+        *p == '\r' ||
+        *p == '\n'
+    ) {
+        p++;
+    }
+
+    return p;
+}
+
+
+static bool json_string(
+    const char *json,
+    const char *key,
+    char *output,
+    size_t output_size
+)
+{
+    char needle[128];
+
+    snprintf(
+        needle,
+        sizeof(needle),
+        "\"%s\"",
+        key
+    );
+
+    const char *p =
+        strstr(
+            json,
+            needle
+        );
+
+    if (!p)
+        return false;
+
+    p += strlen(needle);
+
+    p =
+        skip_json_space(p);
+
+    if (*p != ':')
+        return false;
+
+    p++;
+
+    p =
+        skip_json_space(p);
+
+    if (*p != '"')
+        return false;
+
+    p++;
+
+    size_t out = 0;
+
+    while (
+        *p &&
+        *p != '"' &&
+        out + 1 <
+        output_size
+    ) {
+        if (*p == '\\') {
+            p++;
+
+            if (!*p)
+                break;
+
+            switch (*p) {
+                case '"':
+                    output[out++] = '"';
+                    break;
+
+                case '\\':
+                    output[out++] = '\\';
+                    break;
+
+                case '/':
+                    output[out++] = '/';
+                    break;
+
+                case 'n':
+                    output[out++] = '\n';
+                    break;
+
+                case 'r':
+                    output[out++] = '\r';
+                    break;
+
+                case 't':
+                    output[out++] = '\t';
+                    break;
+
+                case 'b':
+                case 'f':
+                    output[out++] = ' ';
+                    break;
+
+                case 'u':
+                    /*
+                     * Good enough for the API test.
+                     * Full UTF-8 JSON decoding can come later.
+                     */
+                    output[out++] = '?';
+
+                    for (
+                        int i = 0;
+                        i < 4 &&
+                        p[1];
+                        i++
+                    ) {
+                        p++;
+                    }
+
+                    break;
+
+                default:
+                    output[out++] =
+                        *p;
+                    break;
+            }
+
+            p++;
+            continue;
+        }
+
+        output[out++] =
+            *p++;
+    }
+
+    output[out] = '\0';
+
+    return true;
+}
+
+
+static bool json_integer(
+    const char *json,
+    const char *key,
+    unsigned long long *value
+)
+{
+    char needle[128];
+
+    snprintf(
+        needle,
+        sizeof(needle),
+        "\"%s\"",
+        key
+    );
+
+    const char *p =
+        strstr(
+            json,
+            needle
+        );
+
+    if (!p)
+        return false;
+
+    p += strlen(needle);
+
+    p =
+        skip_json_space(p);
+
+    if (*p != ':')
+        return false;
+
+    p++;
+
+    p =
+        skip_json_space(p);
+
+    if (
+        *p < '0' ||
+        *p > '9'
+    ) {
+        return false;
+    }
+
+    *value =
+        strtoull(
+            p,
+            NULL,
+            10
+        );
+
+    return true;
+}
+
+
+static bool json_success(
+    const char *json
+)
+{
+    char status[32];
+
+    if (
+        !json_string(
+            json,
+            "status",
+            status,
+            sizeof(status)
+        )
+    ) {
+        return false;
+    }
+
+    return
+        strcmp(
+            status,
+            "success"
+        ) == 0;
+}
+
+
+/* ========================================================= */
+/* AllDebrid                                                 */
+/* ========================================================= */
+
+static struct curl_slist *
+make_alldebrid_headers(void)
+{
+    if (!g_alldebrid_token[0])
+        return NULL;
+
+    char authorization[1200];
+
+    snprintf(
+        authorization,
+        sizeof(authorization),
+        "Authorization: Bearer %s",
+        g_alldebrid_token
+    );
+
+    struct curl_slist *headers =
+        NULL;
+
+    headers =
+        curl_slist_append(
+            headers,
+            authorization
+        );
+
+    headers =
+        curl_slist_append(
+            headers,
+            "Content-Type: application/x-www-form-urlencoded"
+        );
+
+    return headers;
+}
+
+
+static void configure_curl_common(
+    CURL *curl
+)
+{
+    curl_easy_setopt(
+        curl,
+        CURLOPT_CONNECTTIMEOUT,
+        15L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_TIMEOUT,
+        30L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOSIGNAL,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_HTTP_VERSION,
+        CURL_HTTP_VERSION_1_1
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYPEER,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYHOST,
+        2L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_USERAGENT,
+        g_alldebrid_name[0]
+            ? g_alldebrid_name
+            : "SwitchDebridDownloader"
+    );
+}
+
+
+static bool alldebrid_auth_test(
+    long *http_status,
+    CURLcode *curl_result
+)
+{
+    *http_status = 0;
+
+    *curl_result =
+        CURLE_FAILED_INIT;
+
+    if (!g_alldebrid_token[0])
+        return false;
+
+    CURL *curl =
+        curl_easy_init();
+
+    if (!curl)
+        return false;
+
+    struct curl_slist *headers =
+        make_alldebrid_headers();
+
+    ApiBuffer response = {
+        .data = g_api_body,
+        .capacity =
+            sizeof(g_api_body),
+        .size = 0,
+        .overflow = false
+    };
+
+    g_api_body[0] = '\0';
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_URL,
+        "https://api.alldebrid.com/v4/user"
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_HTTPHEADER,
+        headers
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEFUNCTION,
+        api_write_callback
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEDATA,
+        &response
+    );
+
+    configure_curl_common(
+        curl
+    );
+
+    *curl_result =
+        curl_easy_perform(
+            curl
+        );
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_RESPONSE_CODE,
+        http_status
+    );
+
+    curl_easy_cleanup(
+        curl
+    );
+
+    if (headers)
+        curl_slist_free_all(
+            headers
+        );
+
+    return
+        *curl_result ==
+            CURLE_OK &&
+        *http_status ==
+            200 &&
+        !response.overflow &&
+        json_success(
+            g_api_body
+        );
+}
+
+
+typedef struct {
+    bool success;
+    bool direct_ready;
+
+    long http_status;
+    CURLcode curl_result;
+
+    char filename[1024];
+    unsigned long long filesize;
+
+    char direct_link[8192];
+
+    unsigned long long delayed;
+
+    char error_code[128];
+    char error_message[512];
+} UnlockResult;
+
+
+static void alldebrid_unlock(
+    const char *link,
+    UnlockResult *result
+)
+{
+    memset(
+        result,
+        0,
+        sizeof(*result)
+    );
+
+    result->curl_result =
+        CURLE_FAILED_INIT;
+
+    if (!g_alldebrid_token[0]) {
+        snprintf(
+            result->error_message,
+            sizeof(result->error_message),
+            "AllDebrid token is not configured."
+        );
+
+        return;
+    }
+
+    CURL *curl =
+        curl_easy_init();
+
+    if (!curl) {
+        snprintf(
+            result->error_message,
+            sizeof(result->error_message),
+            "curl_easy_init failed."
+        );
+
+        return;
+    }
+
+    char *escaped =
+        curl_easy_escape(
+            curl,
+            link,
+            0
+        );
+
+    if (!escaped) {
+        snprintf(
+            result->error_message,
+            sizeof(result->error_message),
+            "Could not URL-encode the link."
+        );
+
+        curl_easy_cleanup(
+            curl
+        );
+
+        return;
+    }
+
+    size_t post_size =
+        strlen(escaped) +
+        16;
+
+    char *post_data =
+        malloc(post_size);
+
+    if (!post_data) {
+        curl_free(
+            escaped
+        );
+
+        curl_easy_cleanup(
+            curl
+        );
+
+        snprintf(
+            result->error_message,
+            sizeof(result->error_message),
+            "Out of memory."
+        );
+
+        return;
+    }
+
+    snprintf(
+        post_data,
+        post_size,
+        "link=%s",
+        escaped
+    );
+
+    curl_free(
+        escaped
+    );
+
+    struct curl_slist *headers =
+        make_alldebrid_headers();
+
+    ApiBuffer response = {
+        .data = g_api_body,
+        .capacity =
+            sizeof(g_api_body),
+        .size = 0,
+        .overflow = false
+    };
+
+    g_api_body[0] = '\0';
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_URL,
+        "https://api.alldebrid.com/v4/link/unlock"
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_HTTPHEADER,
+        headers
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_POST,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_POSTFIELDS,
+        post_data
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_POSTFIELDSIZE,
+        (long)strlen(post_data)
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEFUNCTION,
+        api_write_callback
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEDATA,
+        &response
+    );
+
+    configure_curl_common(
+        curl
+    );
+
+    result->curl_result =
+        curl_easy_perform(
+            curl
+        );
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_RESPONSE_CODE,
+        &result->http_status
+    );
+
+    free(
+        post_data
+    );
+
+    curl_easy_cleanup(
+        curl
+    );
+
+    if (headers)
+        curl_slist_free_all(
+            headers
+        );
+
+    if (
+        result->curl_result !=
+            CURLE_OK
+    ) {
+        snprintf(
+            result->error_message,
+            sizeof(result->error_message),
+            "curl error %d",
+            (int)result->curl_result
+        );
+
+        return;
+    }
+
+    if (response.overflow) {
+        snprintf(
+            result->error_message,
+            sizeof(result->error_message),
+            "API response was too large."
+        );
+
+        return;
+    }
+
+    if (
+        result->http_status !=
+            200 ||
+        !json_success(
+            g_api_body
+        )
+    ) {
+        json_string(
+            g_api_body,
+            "code",
+            result->error_code,
+            sizeof(result->error_code)
+        );
+
+        json_string(
+            g_api_body,
+            "message",
+            result->error_message,
+            sizeof(result->error_message)
+        );
+
+        if (
+            !result->
+                error_message[0]
+        ) {
+            snprintf(
+                result->error_message,
+                sizeof(result->error_message),
+                "AllDebrid returned HTTP %ld.",
+                result->http_status
+            );
+        }
+
+        return;
+    }
+
+    result->success = true;
+
+    json_string(
+        g_api_body,
+        "filename",
+        result->filename,
+        sizeof(result->filename)
+    );
+
+    json_integer(
+        g_api_body,
+        "filesize",
+        &result->filesize
+    );
+
+    json_integer(
+        g_api_body,
+        "delayed",
+        &result->delayed
+    );
+
+    if (
+        json_string(
+            g_api_body,
+            "link",
+            result->direct_link,
+            sizeof(result->direct_link)
+        ) &&
+        result->direct_link[0]
+    ) {
+        result->direct_ready =
+            true;
+    }
+}
+
+
+/* ========================================================= */
+/* HTML                                                      */
+/* ========================================================= */
+
+static void html_escape(
+    const char *input,
+    char *output,
+    size_t output_size
+)
+{
+    size_t used = 0;
+
+    while (
+        *input &&
+        used + 1 <
+        output_size
+    ) {
+        const char *replacement =
+            NULL;
+
+        switch (*input) {
+            case '&':
+                replacement = "&amp;";
+                break;
+
+            case '<':
+                replacement = "&lt;";
+                break;
+
+            case '>':
+                replacement = "&gt;";
+                break;
+
+            case '"':
+                replacement = "&quot;";
+                break;
+
+            default:
+                break;
+        }
+
+        if (replacement) {
+            size_t len =
+                strlen(
+                    replacement
+                );
+
+            if (
+                used + len >=
+                output_size
+            ) {
+                break;
+            }
+
+            memcpy(
+                output + used,
+                replacement,
+                len
+            );
+
+            used += len;
+        }
+        else {
+            output[used++] =
+                *input;
+        }
+
+        input++;
+    }
+
+    output[used] = '\0';
+}
+
+
+
+static bool get_session_cookie(
+    const char *request,
+    char *output,
+    size_t output_size
+)
+{
+    const char *headers_end =
+        strstr(
+            request,
+            "\r\n\r\n"
+        );
+
+    if (!headers_end)
+        return false;
+
+    const char *p =
+        strstr(
+            request,
+            "SDDSESSION="
+        );
+
+    if (
+        !p ||
+        p >= headers_end
+    ) {
+        return false;
+    }
+
+    p +=
+        strlen(
+            "SDDSESSION="
+        );
+
+    size_t n = 0;
+
+    while (
+        p < headers_end &&
+        *p &&
+        *p != ';' &&
+        *p != '\r' &&
+        *p != '\n' &&
+        *p != ' ' &&
+        n + 1 < output_size
+    ) {
+        output[n++] =
+            *p++;
+    }
+
+    output[n] = '\0';
+
+    return n > 0;
+}
+
+
+static void send_login_page(
+    int fd,
+    const char *message
+)
+{
+    char body[4096];
+
+    int body_len =
+        snprintf(
+            body,
+            sizeof(body),
+
+            "<!doctype html>"
+            "<html>"
+            "<head>"
+            "<meta name='viewport' "
+            "content='width=device-width,"
+            "initial-scale=1'>"
+            "<title>"
+            "Switch Debrid Downloader"
+            "</title>"
+            
+"<style>"
+"*{box-sizing:border-box}"
+"body{background:#07090d;color:#d9faff;font-family:Arial,sans-serif;}"
+"h2,h3{color:#00f7ff;text-shadow:0 0 10px #00f7ff;}"
+"a{color:#39ff88;text-decoration:none;text-shadow:0 0 7px #39ff88;}"
+"a:hover{color:#fff;}"
+"input,textarea,select{"
+"background:#0d1117;color:#d9faff;"
+"border:1px solid #00f7ff;border-radius:8px;"
+"padding:11px;outline:none;"
+"box-shadow:0 0 8px rgba(0,247,255,.25);"
+"}"
+"input:focus,textarea:focus,select:focus{"
+"border-color:#39ff88;"
+"box-shadow:0 0 12px rgba(57,255,136,.55);"
+"}"
+"button{"
+"background:#071518;color:#39ff88;"
+"border:1px solid #39ff88;border-radius:8px;"
+"padding:12px 20px;font-weight:bold;cursor:pointer;"
+"box-shadow:0 0 10px rgba(57,255,136,.30);"
+"}"
+"button:hover{"
+"background:#39ff88;color:#041008;"
+"box-shadow:0 0 18px rgba(57,255,136,.75);"
+"}"
+"hr{border:0;border-top:1px solid #16343b;margin:25px 0;}"
+"</style>"
+"</head>"
+            "<body style='font-family:sans-serif;"
+            "max-width:520px;margin:40px auto;"
+            "padding:20px'>"
+
+            "<h2>Switch Debrid Downloader</h2>"
+            "<h3>Remote Access Locked</h3>"
+
+            "<p>%s</p>"
+
+            "<form method='POST' action='/login'>"
+            "<label>Password</label><br>"
+            "<input "
+            "type='password' "
+            "name='password' "
+            "autocomplete='current-password' "
+            "style='width:100%%;"
+            "padding:12px;"
+            "box-sizing:border-box'>"
+
+            "<br><br>"
+
+            "<button "
+            "type='submit' "
+            "style='padding:12px 24px'>"
+            "Unlock"
+            "</button>"
+
+            "</form>"
+            "</body>"
+            "</html>",
+
+            message
+                ? message
+                : "Enter the password configured "
+                  "on the Switch."
+        );
+
+    char header[512];
+
+    int header_len =
+        snprintf(
+            header,
+            sizeof(header),
+
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: "
+            "text/html; charset=utf-8\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+
+            body_len
+        );
+
+    send_all(
+        fd,
+        header,
+        (size_t)header_len
+    );
+
+    send_all(
+        fd,
+        body,
+        (size_t)body_len
+    );
+}
+
+
+static void send_login_success(
+    int fd,
+    const char *session
+)
+{
+    char response[1024];
+
+    int len =
+        snprintf(
+            response,
+            sizeof(response),
+
+            "HTTP/1.1 303 See Other\r\n"
+            "Location: /\r\n"
+            "Set-Cookie: "
+            "SDDSESSION=%s; "
+            "Path=/; "
+            "HttpOnly; "
+            "SameSite=Strict\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+
+            session
+        );
+
+    send_all(
+        fd,
+        response,
+        (size_t)len
+    );
+}
+
+
+static void send_logout(
+    int fd
+)
+{
+    static const char response[] =
+        "HTTP/1.1 303 See Other\r\n"
+        "Location: /\r\n"
+        "Set-Cookie: "
+        "SDDSESSION=; "
+        "Path=/; "
+        "Max-Age=0; "
+        "HttpOnly; "
+        "SameSite=Strict\r\n"
+        "Cache-Control: no-store\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+
+    send_all(
+        fd,
+        response,
+        sizeof(response) - 1
+    );
+}
+
+
+
+static void send_alldebrid_pin_page(
+    int fd,
+    const char *message
+)
+{
+    const char *pin =
+        alldebrid_pin_code();
+
+    int expires =
+        alldebrid_pin_expires();
+
+    char body[8192];
+
+    int body_len =
+        snprintf(
+            body,
+            sizeof(body),
+
+            "<!doctype html>"
+            "<html>"
+            "<head>"
+            "<meta name='viewport' "
+            "content='width=device-width,initial-scale=1'>"
+            "<meta http-equiv='refresh' "
+            "content='5;url=/alldebrid-pin-check'>"
+            "<title>AllDebrid PIN</title>"
+
+            "<style>"
+            "*{box-sizing:border-box}"
+            "body{background:#07090d;color:#d9faff;"
+            "font-family:Arial,sans-serif;"
+            "max-width:620px;margin:40px auto;padding:24px}"
+            "h2,h3{color:#00f7ff;"
+            "text-shadow:0 0 10px #00f7ff}"
+            ".pin{font-size:42px;font-weight:bold;"
+            "letter-spacing:8px;color:#39ff88;"
+            "text-shadow:0 0 14px #39ff88;"
+            "padding:20px 0}"
+            "a{color:#39ff88;text-decoration:none}"
+            ".button{display:inline-block;padding:13px 20px;"
+            "border:1px solid #39ff88;border-radius:8px;"
+            "box-shadow:0 0 10px rgba(57,255,136,.35)}"
+            "</style>"
+
+            "</head>"
+            "<body>"
+
+            "<h2>Switch Debrid Downloader</h2>"
+            "<h3>Connect AllDebrid</h3>"
+
+            "<p>%s</p>"
+
+            "<div class='pin'>%s</div>"
+
+            "<p>Expires in approximately %d seconds.</p>"
+
+            "<p>"
+            "<a class='button' "
+            "target='_blank' "
+            "href='https://alldebrid.com/pin/?pin=%s'>"
+            "Open AllDebrid Authorization"
+            "</a>"
+            "</p>"
+
+            "<p>"
+            "This page checks automatically every 5 seconds."
+            "</p>"
+
+            "<p>"
+            "<a href='/alldebrid-pin-check'>"
+            "Check Now"
+            "</a>"
+            " &nbsp;|&nbsp; "
+            "<a href='/'>Cancel</a>"
+            "</p>"
+
+            "</body>"
+            "</html>",
+
+            message
+                ? message
+                : "Authorize this Switch with AllDebrid.",
+
+            pin && pin[0]
+                ? pin
+                : "----",
+
+            expires,
+
+            pin && pin[0]
+                ? pin
+                : ""
+        );
+
+    char header[512];
+
+    int header_len =
+        snprintf(
+            header,
+            sizeof(header),
+
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+
+            body_len
+        );
+
+    send_all(
+        fd,
+        header,
+        (size_t)header_len
+    );
+
+    send_all(
+        fd,
+        body,
+        (size_t)body_len
+    );
+}
+
+
+
+static void send_status_json(
+    int fd
+)
+{
+    DownloaderStats stats;
+
+    downloader_get_stats(
+        &stats
+    );
+
+    char body[512];
+
+    int body_len =
+        snprintf(
+            body,
+            sizeof(body),
+
+            "{"
+            "\"queued\":%d,"
+            "\"active\":%d,"
+            "\"completed\":%d,"
+            "\"failed\":%d,"
+            "\"downloaded\":%llu,"
+            "\"total\":%llu,"
+            "\"bps\":%llu"
+            "}",
+
+            stats.queued,
+            stats.active,
+            stats.completed,
+            stats.failed,
+            stats.current_downloaded,
+            stats.current_total,
+            stats.current_bytes_per_second
+        );
+
+    char header[512];
+
+    int header_len =
+        snprintf(
+            header,
+            sizeof(header),
+
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: %d\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+
+            body_len
+        );
+
+    send_all(
+        fd,
+        header,
+        (size_t)header_len
+    );
+
+    send_all(
+        fd,
+        body,
+        (size_t)body_len
+    );
+}
+
+
+static void send_page(
+    int fd,
+    const char *message
+)
+{
+    DownloaderStats dlstats;
+
+    downloader_get_stats(
+        &dlstats
+    );
+    static const char top[] =
+        "<!doctype html>"
+        "<html>"
+        "<head>"
+        "<meta name='viewport' "
+        "content='width=device-width,initial-scale=1'>"
+        "<title>Switch Debrid Downloader</title>"
+        
+"<style>"
+"*{box-sizing:border-box}"
+"body{background:#07090d;color:#d9faff;font-family:Arial,sans-serif;}"
+"h2,h3{color:#00f7ff;text-shadow:0 0 10px #00f7ff;}"
+"a{color:#39ff88;text-decoration:none;text-shadow:0 0 7px #39ff88;}"
+"a:hover{color:#fff;}"
+"input,textarea,select{"
+"background:#0d1117;color:#d9faff;"
+"border:1px solid #00f7ff;border-radius:8px;"
+"padding:11px;outline:none;"
+"box-shadow:0 0 8px rgba(0,247,255,.25);"
+"}"
+"input:focus,textarea:focus,select:focus{"
+"border-color:#39ff88;"
+"box-shadow:0 0 12px rgba(57,255,136,.55);"
+"}"
+"button{"
+"background:#071518;color:#39ff88;"
+"border:1px solid #39ff88;border-radius:8px;"
+"padding:12px 20px;font-weight:bold;cursor:pointer;"
+"box-shadow:0 0 10px rgba(57,255,136,.30);"
+"}"
+"button:hover{"
+"background:#39ff88;color:#041008;"
+"box-shadow:0 0 18px rgba(57,255,136,.75);"
+"}"
+"hr{border:0;border-top:1px solid #16343b;margin:25px 0;}"
+"</style>"
+"</head>"
+        "<body style='font-family:sans-serif;"
+        "max-width:700px;margin:25px auto;padding:15px'>"
+        "<h2>Switch Debrid Downloader</h2>"
+        "<h3>AllDebrid</h3>";
+
+    static const char form[] =
+        "<form method='POST'>"
+
+        "<label>"
+        "1fichier / supported links "
+        "(one per line)"
+        "</label><br>"
+
+        "<textarea "
+        "name='links' "
+        "rows='12' "
+        "style='width:100%;min-height:220px'></textarea>"
+
+        "<br><br>"
+
+        "<button "
+        "type='submit' "
+        "formaction='/queue' "
+        "style='padding:12px'>"
+        "Queue All Links"
+        "</button>"
+
+        " "
+
+        "<button "
+        "type='submit' "
+        "formaction='/diag-network' "
+        "onclick=\"this.textContent='Testing...';\">"
+        "Network-only test"
+        "</button>"
+
+        " "
+
+        "<button "
+        "type='submit' "
+        "formaction='/diag-edge' "
+        "onclick=\"this.textContent='Testing...';\">"
+        "Edge User-Agent"
+        "</button>"
+
+        " "
+
+        "<button "
+        "type='submit' "
+        "formaction='/diag-http2' "
+        "onclick=\"this.textContent='Testing...';\">"
+        "HTTP/2 test"
+        "</button>"
+
+        " "
+
+        "<button "
+        "type='submit' "
+        "formaction='/diag-segmented' "
+        "onclick=\"this.textContent='Testing...';\">"
+        "4-way segmented"
+        "</button>"
+
+        " "
+
+        "<button "
+        "type='submit' "
+        "formaction='/diag-seg8' "
+        "onclick=\"this.textContent='Testing 128 MiB...';\">"
+        "8-way / 128 MiB"
+        "</button>"
+
+        " "
+
+        "<button "
+        "type='submit' "
+        "formaction='/diag-seg16' "
+        "onclick=\"this.textContent='Testing 128 MiB...';\">"
+        "16-way / 128 MiB"
+        "</button>"
+
+        " "
+
+        "<button "
+        "type='submit' "
+        "formaction='/diag-fullget' "
+        "onclick=\"this.textContent='Testing...';\">"
+        "Full GET"
+        "</button>"
+
+        " "
+
+        "<button "
+        "type='submit' "
+        "formaction='/diag-direct-meta'>"
+        "Connection info"
+        "</button>"
+
+        " "
+
+        "<button "
+        "type='submit' "
+        "formaction='/diag-direct-edge' "
+        "formtarget='_blank'>"
+        "Open exact URL in Edge"
+        "</button>"
+
+        "</form>"
+
+        "<p>"
+        "<a href='/diag-sd'>"
+        "SD write-speed test"
+        "</a>"
+        " &nbsp;|&nbsp; "
+        "<a href='/diag-raw-network'>"
+        "Raw Internet test"
+        "</a>"
+        " &nbsp;|&nbsp; "
+        "<a href='/diag-curl-info'>"
+        "libcurl / TLS info"
+        "</a>"
+        "</p>"
+
+        "<hr>"
+
+        "<p>"
+        "<a href='/alldebrid-connect'>"
+        "Connect AllDebrid"
+        "</a>"
+        " | "
+        "<a href='/alldebrid-disconnect'>"
+        "Disconnect AllDebrid"
+        "</a>"
+        " | "
+        "<a href='/reload-config'>"
+        "Reload config.ini"
+        "</a>"
+        "</p>"
+
+
+        "<script>"
+        "async function refreshStats(){"
+        "try{"
+        "const r=await fetch('/status',{cache:'no-store'});"
+        "if(!r.ok)return;"
+        "const s=await r.json();"
+        "document.getElementById('stat-queued').textContent=s.queued;"
+        "document.getElementById('stat-active').textContent=s.active;"
+        "document.getElementById('stat-completed').textContent=s.completed;"
+        "document.getElementById('stat-failed').textContent=s.failed;"
+
+        "let d=s.downloaded/1048576;"
+        "let t=s.total/1048576;"
+
+        "document.getElementById('stat-progress').textContent="
+        "s.total>0?"
+        "d.toFixed(1)+' / '+t.toFixed(1)+' MB':"
+        "d.toFixed(1)+' MB';"
+        "document.getElementById('stat-speed').textContent="
+        "(s.bps/1048576).toFixed(2)+' MB/s';"
+        "}catch(e){}"
+        "}"
+        "refreshStats();"
+        "setInterval(refreshStats,1000);"
+        "</script>"
+        "</body></html>";
+
+    char safe_message[4096];
+
+    html_escape(
+        message
+            ? message
+            : "Ready.",
+        safe_message,
+        sizeof(safe_message)
+    );
+
+    char status[6144];
+
+    snprintf(
+        status,
+        sizeof(status),
+
+        "<p><b>%s</b></p>"
+
+        "<p>"
+        "AllDebrid: <b>%s</b><br>"
+        "Client name: <b>%s</b><br>"
+        "Max simultaneous downloads: "
+        "<b>%d</b><br>"
+        "Last submitted: <b>%u</b><br>"
+        "Queued now: <b id='stat-queued'>%d</b><br>"
+        "Downloading now: <b id='stat-active'>%d</b><br>"
+        "Completed: <b id='stat-completed'>%d</b><br>"
+        "Failed: <b id='stat-failed'>%d</b><br>"
+        "Progress: <b id='stat-progress'>0 MB</b><br>"
+        "Speed: <b id='stat-speed'>0 MB/s</b>"
+        "</p>",
+
+        safe_message,
+
+        g_alldebrid_connected
+            ? "CONNECTED - session only"
+            : "NOT CONNECTED",
+
+        g_alldebrid_name[0]
+            ? g_alldebrid_name
+            : "SwitchDebridDownloader",
+
+        g_max_concurrent,
+        g_last_queued,
+        dlstats.queued,
+        dlstats.active,
+        dlstats.completed,
+        dlstats.failed
+    );
+
+    size_t body_length =
+        sizeof(top) - 1 +
+        strlen(status) +
+        sizeof(form) - 1;
+
+    char header[512];
+
+    int header_length =
+        snprintf(
+            header,
+            sizeof(header),
+
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: "
+            "text/html; charset=utf-8\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+
+            body_length
+        );
+
+    send_all(
+        fd,
+        header,
+        (size_t)header_length
+    );
+
+    send_all(
+        fd,
+        top,
+        sizeof(top) - 1
+    );
+
+    send_all(
+        fd,
+        status,
+        strlen(status)
+    );
+
+    send_all(
+        fd,
+        form,
+        sizeof(form) - 1
+    );
+}
+
+
+static void send_redirect(
+    int fd
+)
+{
+    static const char response[] =
+        "HTTP/1.1 303 See Other\r\n"
+        "Location: /\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+
+    send_all(
+        fd,
+        response,
+        sizeof(response) - 1
+    );
+}
+
+
+/* ========================================================= */
+/* HTTP reader                                               */
+/* ========================================================= */
+
+static ssize_t read_request(
+    int fd
+)
+{
+    size_t used = 0;
+
+    while (
+        used + 1 <
+        sizeof(g_request)
+    ) {
+        ssize_t n =
+            recv(
+                fd,
+                g_request + used,
+                sizeof(g_request)
+                    - used - 1,
+                0
+            );
+
+        if (n <= 0)
+            break;
+
+        used +=
+            (size_t)n;
+
+        g_request[used] =
+            '\0';
+
+        char *headers_end =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!headers_end)
+            continue;
+
+        if (
+            strncmp(
+                g_request,
+                "GET ",
+                4
+            ) == 0
+        ) {
+            break;
+        }
+
+        const char *cl =
+            strstr(
+                g_request,
+                "Content-Length:"
+            );
+
+        if (!cl) {
+            cl =
+                strstr(
+                    g_request,
+                    "content-length:"
+                );
+        }
+
+        if (cl) {
+            size_t content_length =
+                strtoul(
+                    cl + 15,
+                    NULL,
+                    10
+                );
+
+            size_t header_length =
+                (size_t)(
+                    headers_end +
+                    4 -
+                    g_request
+                );
+
+            if (
+                used >=
+                header_length +
+                content_length
+            ) {
+                break;
+            }
+        }
+        else {
+            break;
+        }
+    }
+
+    g_request[used] =
+        '\0';
+
+    return
+        (ssize_t)used;
+}
+
+
+/* ========================================================= */
+/* Routes                                                    */
+/* ========================================================= */
+
+static void handle_client(
+    int fd,
+    const char *client_ip
+)
+{
+    if (
+        read_request(
+            fd
+        ) <= 0
+    ) {
+        return;
+    }
+
+    /*
+     * /login is deliberately the only unauthenticated
+     * action.
+     */
+    if (
+        strncmp(
+            g_request,
+            "POST /login ",
+            12
+        ) == 0
+    ) {
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_login_page(
+                fd,
+                "Invalid login request."
+            );
+
+            return;
+        }
+
+        body += 4;
+
+        char password[256] = {0};
+
+        form_value(
+            body,
+            "password",
+            password,
+            sizeof(password)
+        );
+
+        bool valid =
+            remote_auth_verify(
+                password
+            );
+
+        memset(
+            password,
+            0,
+            sizeof(password)
+        );
+
+        if (!valid) {
+            /*
+             * Slow down simple brute-force attempts.
+             */
+            svcSleepThread(
+                1500LL *
+                1000LL *
+                1000LL
+            );
+
+            send_login_page(
+                fd,
+                "Incorrect password."
+            );
+
+            return;
+        }
+
+        char session[65];
+
+        if (
+            !remote_auth_create_session(
+                client_ip,
+                session,
+                sizeof(session)
+            )
+        ) {
+            send_login_page(
+                fd,
+                "Could not create session."
+            );
+
+            return;
+        }
+
+        send_login_success(
+            fd,
+            session
+        );
+
+        memset(
+            session,
+            0,
+            sizeof(session)
+        );
+
+        return;
+    }
+
+
+    char session[65] = {0};
+
+    bool authenticated =
+        get_session_cookie(
+            g_request,
+            session,
+            sizeof(session)
+        ) &&
+        remote_auth_session_valid(
+            session,
+            client_ip
+        );
+
+    if (!authenticated) {
+        send_login_page(
+            fd,
+            "Enter the remote access password."
+        );
+
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "GET /logout ",
+            12
+        ) == 0
+    ) {
+        remote_auth_revoke_session(
+            session,
+            client_ip
+        );
+
+        send_logout(
+            fd
+        );
+
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "GET /alldebrid-connect ",
+            23
+        ) == 0
+    ) {
+        if (g_alldebrid_connected) {
+            send_page(
+                fd,
+                "AllDebrid is already connected."
+            );
+
+            return;
+        }
+
+        char error[512] = {0};
+
+        if (
+            !alldebrid_pin_start(
+                error,
+                sizeof(error)
+            )
+        ) {
+            send_page(
+                fd,
+                error[0]
+                    ? error
+                    : "Could not start AllDebrid PIN authentication."
+            );
+
+            return;
+        }
+
+        send_alldebrid_pin_page(
+            fd,
+            "Enter this PIN on AllDebrid."
+        );
+
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "GET /alldebrid-pin-check ",
+            25
+        ) == 0
+    ) {
+        if (
+            !alldebrid_pin_pending()
+        ) {
+            send_page(
+                fd,
+                g_alldebrid_connected
+                    ? "AllDebrid is connected."
+                    : "No AllDebrid PIN authentication is active."
+            );
+
+            return;
+        }
+
+        bool activated = false;
+        char apikey[1024] = {0};
+        char error[512] = {0};
+
+        bool ok =
+            alldebrid_pin_check(
+                &activated,
+                apikey,
+                sizeof(apikey),
+                error,
+                sizeof(error)
+            );
+
+        if (!ok) {
+            memset(
+                apikey,
+                0,
+                sizeof(apikey)
+            );
+
+            send_page(
+                fd,
+                error[0]
+                    ? error
+                    : "AllDebrid PIN check failed."
+            );
+
+            return;
+        }
+
+        if (!activated) {
+            send_alldebrid_pin_page(
+                fd,
+                "Waiting for AllDebrid approval..."
+            );
+
+            return;
+        }
+
+        downloader_set_token(
+            apikey
+        );
+
+        memset(
+            apikey,
+            0,
+            sizeof(apikey)
+        );
+
+        g_alldebrid_connected =
+            true;
+
+        alldebrid_pin_reset();
+
+        send_page(
+            fd,
+            "AllDebrid connected successfully. "
+            "The API key is stored in RAM only."
+        );
+
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "GET /alldebrid-disconnect ",
+            26
+        ) == 0
+    ) {
+        downloader_set_token(
+            ""
+        );
+
+        g_alldebrid_connected =
+            false;
+
+        alldebrid_pin_reset();
+
+        send_page(
+            fd,
+            "AllDebrid disconnected. "
+            "The session API key was cleared from RAM."
+        );
+
+        return;
+    }
+
+
+
+    if (
+        strncmp(
+            g_request,
+            "GET /status ",
+            12
+        ) == 0
+    ) {
+        send_status_json(
+            fd
+        );
+
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "GET / ",
+            6
+        ) == 0
+    ) {
+        send_page(
+            fd,
+            "Ready."
+        );
+
+        return;
+    }
+
+    if (
+        strncmp(
+            g_request,
+            "GET /reload-config ",
+            19
+        ) == 0
+    ) {
+        load_config();
+
+    /*
+     * AllDebrid authentication is session-only.
+     * Ignore any legacy token still present in config.ini.
+     */
+    g_alldebrid_token[0] = '\0';
+
+        send_redirect(
+            fd
+        );
+
+        return;
+    }
+
+    if (
+        strncmp(
+            g_request,
+            "GET /alldebrid-test ",
+            20
+        ) == 0
+    ) {
+        if (
+            !g_alldebrid_token[0]
+        ) {
+            send_page(
+                fd,
+                "AllDebrid token is not configured."
+            );
+
+            return;
+        }
+
+        long status = 0;
+        CURLcode curl_result;
+
+        bool ok =
+            alldebrid_auth_test(
+                &status,
+                &curl_result
+            );
+
+        char message[512];
+
+        if (ok) {
+            snprintf(
+                message,
+                sizeof(message),
+                "AllDebrid authentication OK. "
+                "HTTP %ld.",
+                status
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+                "AllDebrid authentication failed. "
+                "HTTP %ld, curl %d.",
+                status,
+                (int)curl_result
+            );
+        }
+
+        send_page(
+            fd,
+            message
+        );
+
+        return;
+    }
+
+    if (
+        strncmp(
+            g_request,
+            "GET /diag-raw-network ",
+            22
+        ) == 0
+    ) {
+        double speed = 0.0;
+        unsigned long long bytes = 0;
+        char error[512] = {0};
+
+        bool ok =
+            downloader_debug_raw_network(
+                &speed,
+                &bytes,
+                error,
+                sizeof(error)
+            );
+
+        char message[1024];
+
+        if (ok) {
+            snprintf(
+                message,
+                sizeof(message),
+
+                "RAW INTERNET TEST: "
+                "%.2f MB/s "
+                "(%.1f MB transferred)",
+
+                speed,
+                (double)bytes /
+                    1048576.0
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+                "RAW INTERNET TEST FAILED: %s",
+                error
+            );
+        }
+
+        send_page(
+            fd,
+            message
+        );
+
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "GET /diag-sd ",
+            13
+        ) == 0
+    ) {
+        double speed = 0.0;
+        char error[512] = {0};
+
+        bool ok =
+            downloader_debug_sd(
+                &speed,
+                error,
+                sizeof(error)
+            );
+
+        char message[768];
+
+        if (ok) {
+            snprintf(
+                message,
+                sizeof(message),
+                "SD WRITE TEST: %.2f MB/s",
+                speed
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+                "SD WRITE TEST FAILED: %s",
+                error
+            );
+        }
+
+        send_page(
+            fd,
+            message
+        );
+
+        return;
+    }
+
+
+
+    if (
+        strncmp(
+            g_request,
+            "POST /diag-edge ",
+            16
+        ) == 0
+    ) {
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(fd, "Invalid request.");
+            return;
+        }
+
+        body += 4;
+
+        char links[8192] = {0};
+        char link[8192] = {0};
+
+        form_value(
+            body,
+            "links",
+            links,
+            sizeof(links)
+        );
+
+        if (
+            !first_link(
+                links,
+                link,
+                sizeof(link)
+            )
+        ) {
+            send_page(fd, "Paste one link first.");
+            return;
+        }
+
+        double speed = 0.0;
+        unsigned long long bytes = 0;
+        char error[512] = {0};
+
+        bool ok =
+            downloader_debug_edge_ua(
+                link,
+                &speed,
+                &bytes,
+                error,
+                sizeof(error)
+            );
+
+        char message[1024];
+
+        if (ok) {
+            snprintf(
+                message,
+                sizeof(message),
+                "EDGE USER-AGENT TEST: %.2f MB/s "
+                "(%.1f MB transferred)",
+                speed,
+                (double)bytes / 1048576.0
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+                "EDGE USER-AGENT TEST FAILED: %s",
+                error
+            );
+        }
+
+        send_page(fd, message);
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "POST /diag-http2 ",
+            17
+        ) == 0
+    ) {
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(fd, "Invalid request.");
+            return;
+        }
+
+        body += 4;
+
+        char links[8192] = {0};
+        char link[8192] = {0};
+
+        form_value(
+            body,
+            "links",
+            links,
+            sizeof(links)
+        );
+
+        if (
+            !first_link(
+                links,
+                link,
+                sizeof(link)
+            )
+        ) {
+            send_page(fd, "Paste one link first.");
+            return;
+        }
+
+        double speed = 0.0;
+        unsigned long long bytes = 0;
+        long version = 0;
+        char error[512] = {0};
+
+        bool ok =
+            downloader_debug_http2(
+                link,
+                &speed,
+                &bytes,
+                &version,
+                error,
+                sizeof(error)
+            );
+
+        char message[1024];
+
+        if (ok) {
+            const char *proto =
+                version == CURL_HTTP_VERSION_2_0
+                    ? "HTTP/2"
+                    : "not HTTP/2";
+
+            snprintf(
+                message,
+                sizeof(message),
+                "HTTP/2 TEST: %.2f MB/s "
+                "(%.1f MB transferred, negotiated %s)",
+                speed,
+                (double)bytes / 1048576.0,
+                proto
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+                "HTTP/2 TEST FAILED: %s",
+                error
+            );
+        }
+
+        send_page(fd, message);
+        return;
+    }
+
+
+
+
+    if (
+        strncmp(
+            g_request,
+            "POST /diag-direct-meta ",
+            23
+        ) == 0
+    ) {
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(
+                fd,
+                "Invalid request."
+            );
+
+            return;
+        }
+
+        body += 4;
+
+        char links[8192] = {0};
+        char link[8192] = {0};
+
+        form_value(
+            body,
+            "links",
+            links,
+            sizeof(links)
+        );
+
+        if (
+            !first_link(
+                links,
+                link,
+                sizeof(link)
+            )
+        ) {
+            send_page(
+                fd,
+                "Paste one link first."
+            );
+
+            return;
+        }
+
+        DownloaderConnectionInfo info;
+
+        char error[512] = {0};
+
+        bool ok =
+            downloader_debug_direct_metadata(
+                link,
+                &info,
+                error,
+                sizeof(error)
+            );
+
+        char message[2048];
+
+        if (ok) {
+            const char *proto =
+                info.http_version ==
+                    CURL_HTTP_VERSION_1_1
+                    ? "HTTP/1.1"
+                    :
+                info.http_version ==
+                    CURL_HTTP_VERSION_2_0
+                    ? "HTTP/2"
+                    :
+                    "other";
+
+            snprintf(
+                message,
+                sizeof(message),
+
+                "DIRECT CONNECTION INFO<br><br>"
+                "Host: <b>%s</b><br>"
+                "Resolved IP: <b>%s</b><br>"
+                "HTTP status: <b>%ld</b><br>"
+                "Protocol: <b>%s</b><br><br>"
+                "DNS: <b>%.3f s</b><br>"
+                "TCP connected: <b>%.3f s</b><br>"
+                "TLS ready: <b>%.3f s</b><br>"
+                "First byte: <b>%.3f s</b><br>"
+                "Diagnostic total: <b>%.3f s</b>",
+
+                info.host[0]
+                    ? info.host
+                    : "unknown",
+
+                info.primary_ip[0]
+                    ? info.primary_ip
+                    : "unknown",
+
+                info.http_status,
+                proto,
+
+                info.dns_seconds,
+                info.tcp_seconds,
+                info.tls_seconds,
+                info.ttfb_seconds,
+                info.total_seconds
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+                "CONNECTION INFO FAILED: %s",
+                error
+            );
+        }
+
+        send_page(
+            fd,
+            message
+        );
+
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "POST /diag-direct-edge ",
+            23
+        ) == 0
+    ) {
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(
+                fd,
+                "Invalid request."
+            );
+
+            return;
+        }
+
+        body += 4;
+
+        char links[8192] = {0};
+        char link[8192] = {0};
+
+        form_value(
+            body,
+            "links",
+            links,
+            sizeof(links)
+        );
+
+        if (
+            !first_link(
+                links,
+                link,
+                sizeof(link)
+            )
+        ) {
+            send_page(
+                fd,
+                "Paste one link first."
+            );
+
+            return;
+        }
+
+        char direct_url[8192] = {0};
+        char error[512] = {0};
+
+        bool ok =
+            downloader_unlock_direct_url(
+                link,
+                direct_url,
+                sizeof(direct_url),
+                error,
+                sizeof(error)
+            );
+
+        if (!ok) {
+            char message[768];
+
+            snprintf(
+                message,
+                sizeof(message),
+                "DIRECT URL FAILED: %s",
+                error
+            );
+
+            send_page(
+                fd,
+                message
+            );
+
+            return;
+        }
+
+        /*
+         * Browser receives the exact direct URL generated
+         * by AllDebrid and downloads it itself.
+         */
+        char header[9216];
+
+        int header_len =
+            snprintf(
+                header,
+                sizeof(header),
+
+                "HTTP/1.1 303 See Other\r\n"
+                "Location: %s\r\n"
+                "Cache-Control: no-store\r\n"
+                "Connection: close\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n",
+
+                direct_url
+            );
+
+        send_all(
+            fd,
+            header,
+            (size_t)header_len
+        );
+
+        memset(
+            direct_url,
+            0,
+            sizeof(direct_url)
+        );
+
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "POST /diag-fullget ",
+            19
+        ) == 0
+    ) {
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(fd, "Invalid request.");
+            return;
+        }
+
+        body += 4;
+
+        char links[8192] = {0};
+        char link[8192] = {0};
+
+        form_value(
+            body,
+            "links",
+            links,
+            sizeof(links)
+        );
+
+        if (
+            !first_link(
+                links,
+                link,
+                sizeof(link)
+            )
+        ) {
+            send_page(fd, "Paste one link first.");
+            return;
+        }
+
+        double speed = 0.0;
+        unsigned long long bytes = 0;
+        char error[512] = {0};
+
+        bool ok =
+            downloader_debug_full_get(
+                link,
+                &speed,
+                &bytes,
+                error,
+                sizeof(error)
+            );
+
+        char message[1024];
+
+        if (ok) {
+            snprintf(
+                message,
+                sizeof(message),
+                "FULL GET TEST: %.2f MB/s "
+                "(%.1f MB transferred, no Range header)",
+                speed,
+                (double)bytes / 1048576.0
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+                "FULL GET TEST FAILED: %s",
+                error
+            );
+        }
+
+        send_page(fd, message);
+        return;
+    }
+
+
+
+    if (
+        strncmp(
+            g_request,
+            "GET /diag-curl-info ",
+            20
+        ) == 0
+    ) {
+        char curl_version[128] = {0};
+        char ssl_version[256] = {0};
+        bool http2 = false;
+
+        downloader_get_curl_runtime_info(
+            curl_version,
+            sizeof(curl_version),
+            ssl_version,
+            sizeof(ssl_version),
+            &http2
+        );
+
+        char message[1024];
+
+        snprintf(
+            message,
+            sizeof(message),
+
+            "LIBCURL RUNTIME INFO<br><br>"
+            "libcurl: <b>%s</b><br>"
+            "TLS backend: <b>%s</b><br>"
+            "HTTP/2 compiled in: <b>%s</b>",
+
+            curl_version,
+            ssl_version,
+            http2
+                ? "YES"
+                : "NO"
+        );
+
+        send_page(
+            fd,
+            message
+        );
+
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "POST /diag-seg8 ",
+            16
+        ) == 0
+    ) {
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(fd, "Invalid request.");
+            return;
+        }
+
+        body += 4;
+
+        char links[8192] = {0};
+        char link[8192] = {0};
+
+        form_value(
+            body,
+            "links",
+            links,
+            sizeof(links)
+        );
+
+        if (
+            !first_link(
+                links,
+                link,
+                sizeof(link)
+            )
+        ) {
+            send_page(
+                fd,
+                "Paste one link first."
+            );
+
+            return;
+        }
+
+        double speed = 0.0;
+        unsigned long long bytes = 0;
+        char error[512] = {0};
+
+        bool ok =
+            downloader_debug_segmented_8(
+                link,
+                &speed,
+                &bytes,
+                error,
+                sizeof(error)
+            );
+
+        char message[1024];
+
+        if (ok) {
+            snprintf(
+                message,
+                sizeof(message),
+
+                "8-WAY / 128 MiB TEST: "
+                "%.2f MB/s "
+                "(%.1f MB transferred)",
+
+                speed,
+                (double)bytes /
+                    1048576.0
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+                "8-WAY TEST FAILED: %s",
+                error
+            );
+        }
+
+        send_page(fd, message);
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "POST /diag-seg16 ",
+            17
+        ) == 0
+    ) {
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(fd, "Invalid request.");
+            return;
+        }
+
+        body += 4;
+
+        char links[8192] = {0};
+        char link[8192] = {0};
+
+        form_value(
+            body,
+            "links",
+            links,
+            sizeof(links)
+        );
+
+        if (
+            !first_link(
+                links,
+                link,
+                sizeof(link)
+            )
+        ) {
+            send_page(
+                fd,
+                "Paste one link first."
+            );
+
+            return;
+        }
+
+        double speed = 0.0;
+        unsigned long long bytes = 0;
+        char error[512] = {0};
+
+        bool ok =
+            downloader_debug_segmented_16(
+                link,
+                &speed,
+                &bytes,
+                error,
+                sizeof(error)
+            );
+
+        char message[1024];
+
+        if (ok) {
+            snprintf(
+                message,
+                sizeof(message),
+
+                "16-WAY / 128 MiB TEST: "
+                "%.2f MB/s "
+                "(%.1f MB transferred)",
+
+                speed,
+                (double)bytes /
+                    1048576.0
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+                "16-WAY TEST FAILED: %s",
+                error
+            );
+        }
+
+        send_page(fd, message);
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "POST /diag-segmented ",
+            21
+        ) == 0
+    ) {
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(fd, "Invalid request.");
+            return;
+        }
+
+        body += 4;
+
+        char links[8192] = {0};
+        char link[8192] = {0};
+
+        form_value(
+            body,
+            "links",
+            links,
+            sizeof(links)
+        );
+
+        if (
+            !first_link(
+                links,
+                link,
+                sizeof(link)
+            )
+        ) {
+            send_page(fd, "Paste one link first.");
+            return;
+        }
+
+        double speed = 0.0;
+        unsigned long long bytes = 0;
+        char error[512] = {0};
+
+        bool ok =
+            downloader_debug_segmented(
+                link,
+                &speed,
+                &bytes,
+                error,
+                sizeof(error)
+            );
+
+        char message[1024];
+
+        if (ok) {
+            snprintf(
+                message,
+                sizeof(message),
+                "4-WAY SEGMENTED TEST: %.2f MB/s "
+                "(%.1f MB transferred)",
+                speed,
+                (double)bytes / 1048576.0
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+                "4-WAY SEGMENTED TEST FAILED: %s",
+                error
+            );
+        }
+
+        send_page(fd, message);
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "POST /diag-network ",
+            19
+        ) == 0
+    ) {
+        if (!g_alldebrid_connected) {
+            send_page(
+                fd,
+                "Connect AllDebrid first."
+            );
+
+            return;
+        }
+
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(
+                fd,
+                "Invalid diagnostic request."
+            );
+
+            return;
+        }
+
+        body += 4;
+
+        char links[8192] = {0};
+
+        form_value(
+            body,
+            "links",
+            links,
+            sizeof(links)
+        );
+
+        char link[8192] = {0};
+
+        if (
+            !first_link(
+                links,
+                link,
+                sizeof(link)
+            )
+        ) {
+            send_page(
+                fd,
+                "Paste one link before running the network test."
+            );
+
+            return;
+        }
+
+        double speed = 0.0;
+
+        unsigned long long bytes = 0;
+
+        char error[512] = {0};
+
+        bool ok =
+            downloader_debug_network(
+                link,
+                &speed,
+                &bytes,
+                error,
+                sizeof(error)
+            );
+
+        char message[1024];
+
+        if (ok) {
+            snprintf(
+                message,
+                sizeof(message),
+
+                "NETWORK-ONLY TEST: "
+                "%.2f MB/s "
+                "(%.1f MB transferred, "
+                "nothing written to SD)",
+
+                speed,
+                (double)bytes /
+                    1048576.0
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+                "NETWORK TEST FAILED: %s",
+                error
+            );
+        }
+
+        send_page(
+            fd,
+            message
+        );
+
+        return;
+    }
+
+
+    if (
+        strncmp(
+            g_request,
+            "POST /queue ",
+            12
+        ) == 0
+    ) {
+        if (!g_alldebrid_connected) {
+            send_page(
+                fd,
+                "Connect AllDebrid before queueing downloads."
+            );
+
+            return;
+        }
+
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(
+                fd,
+                "Invalid request."
+            );
+
+            return;
+        }
+
+        body += 4;
+
+        memset(
+            g_links,
+            0,
+            sizeof(g_links)
+        );
+
+        form_value(
+            body,
+            "links",
+            g_links,
+            sizeof(g_links)
+        );
+
+        if (!g_links[0]) {
+            send_page(
+                fd,
+                "Paste at least one link."
+            );
+
+            return;
+        }
+
+        g_last_queued =
+            queue_multiple_links(
+                g_links
+            );
+
+        printf(
+            "\nQueued %u AllDebrid link(s).\n",
+            g_last_queued
+        );
+
+        consoleUpdate(NULL);
+
+        send_redirect(
+            fd
+        );
+
+        return;
+    }
+
+    if (
+        strncmp(
+            g_request,
+            "POST /unlock-test ",
+            18
+        ) == 0
+    ) {
+        char *body =
+            strstr(
+                g_request,
+                "\r\n\r\n"
+            );
+
+        if (!body) {
+            send_page(
+                fd,
+                "Invalid request."
+            );
+
+            return;
+        }
+
+        body += 4;
+
+        memset(
+            g_links,
+            0,
+            sizeof(g_links)
+        );
+
+        form_value(
+            body,
+            "links",
+            g_links,
+            sizeof(g_links)
+        );
+
+        char link[8192];
+
+        if (
+            !first_link(
+                g_links,
+                link,
+                sizeof(link)
+            )
+        ) {
+            send_page(
+                fd,
+                "Paste at least one link."
+            );
+
+            return;
+        }
+
+        printf(
+            "\nTesting AllDebrid unlock...\n"
+        );
+
+        consoleUpdate(NULL);
+
+        UnlockResult result;
+
+        alldebrid_unlock(
+            link,
+            &result
+        );
+
+        char message[3072];
+
+        if (!result.success) {
+            if (
+                result.error_code[0]
+            ) {
+                snprintf(
+                    message,
+                    sizeof(message),
+
+                    "Unlock failed. "
+                    "HTTP %ld. "
+                    "%s: %s",
+
+                    result.http_status,
+                    result.error_code,
+                    result.error_message
+                );
+            }
+            else {
+                snprintf(
+                    message,
+                    sizeof(message),
+
+                    "Unlock failed. "
+                    "HTTP %ld. %s",
+
+                    result.http_status,
+                    result.error_message
+                );
+            }
+        }
+        else if (
+            result.delayed > 0 &&
+            !result.direct_ready
+        ) {
+            snprintf(
+                message,
+                sizeof(message),
+
+                "Unlock accepted. "
+                "Filename: %s. "
+                "Size: %llu bytes. "
+                "AllDebrid returned delayed ID %llu. "
+                "Delayed polling will be added next.",
+
+                result.filename[0]
+                    ? result.filename
+                    : "(unknown)",
+
+                result.filesize,
+                result.delayed
+            );
+        }
+        else if (
+            result.direct_ready
+        ) {
+            snprintf(
+                message,
+                sizeof(message),
+
+                "Unlock SUCCESS. "
+                "Filename: %s. "
+                "Size: %llu bytes. "
+                "Direct download link is ready.",
+
+                result.filename[0]
+                    ? result.filename
+                    : "(unknown)",
+
+                result.filesize
+            );
+        }
+        else {
+            snprintf(
+                message,
+                sizeof(message),
+
+                "AllDebrid accepted the link, "
+                "but no direct or delayed link "
+                "was returned."
+            );
+        }
+
+        send_page(
+            fd,
+            message
+        );
+
+        return;
+    }
+
+    static const char not_found[] =
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Length: 0\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+
+    send_all(
+        fd,
+        not_found,
+        sizeof(not_found) - 1
+    );
+}
+
+
+/* ========================================================= */
+/* Main                                                      */
+/* ========================================================= */
+
+int main(
+    int argc,
+    char **argv
+)
+{
+    (void)argc;
+    (void)argv;
+
+    consoleInit(NULL);
+
+    padConfigureInput(
+        1,
+        HidNpadStyleSet_NpadStandard
+    );
+
+    PadState pad;
+    padInitializeDefault(&pad);
+
+    printf(
+        "Switch Debrid Downloader\n"
+        "Stage 2B - AllDebrid Unlock Test\n\n"
+    );
+
+    load_config();
+
+    if (
+        !remote_auth_ensure_password()
+    ) {
+        printf(
+            "\nRemote password setup failed "
+            "or was cancelled.\n"
+            "Press + to exit.\n"
+        );
+
+        consoleUpdate(NULL);
+
+        while (
+            appletMainLoop()
+        ) {
+            padUpdate(&pad);
+
+            if (
+                padGetButtonsDown(&pad) &
+                HidNpadButton_Plus
+            ) {
+                break;
+            }
+        }
+
+        consoleExit(NULL);
+        return 0;
+    }
+
+    printf(
+        "\nRemote password ready.\n"
+    );
+
+    consoleUpdate(NULL);
+
+    /*
+     * Larger TCP receive window for high-bandwidth,
+     * higher-latency downloads.
+     *
+     * Preserve every other libnx default setting.
+     */
+    /*
+     * Socket configuration matched to the uploaded
+     * Tinfoil 20.0 NRO defaults.
+     */
+    /*
+     * Match Tinfoil socket.json.
+     *
+     * TCP initial: 256 KiB
+     * TCP maximum: 512 KiB
+     * sb_efficiency: 4
+     */
+    SocketInitConfig socket_config =
+        *socketGetDefaultInitConfig();
+
+    socket_config.tcp_tx_buf_size =
+        262144;
+
+    socket_config.tcp_rx_buf_size =
+        262144;
+
+    socket_config.tcp_tx_buf_max_size =
+        524288;
+
+    socket_config.tcp_rx_buf_max_size =
+        524288;
+
+    socket_config.udp_tx_buf_size =
+        9216;
+
+    socket_config.udp_rx_buf_size =
+        42240;
+
+    socket_config.sb_efficiency =
+        4;
+
+
+    /*
+     * Tinfoil uses 8 BSD service sessions.
+     * libnx default is only 3.
+     */
+    socket_config.num_bsd_sessions =
+        8;
+
+    Result rc =
+        socketInitialize(
+            &socket_config
+        );
+
+    if (R_FAILED(rc)) {
+        printf(
+            "Network init failed: "
+            "0x%08X\n",
+            rc
+        );
+
+        consoleUpdate(NULL);
+
+        while (
+            appletMainLoop()
+        ) {
+            padUpdate(
+                &pad
+            );
+
+            if (
+                padGetButtonsDown(
+                    &pad
+                ) &
+                HidNpadButton_Plus
+            ) {
+                break;
+            }
+        }
+
+        consoleExit(NULL);
+
+        return 0;
+    }
+
+    CURLcode curl_init =
+        curl_global_init(
+            CURL_GLOBAL_DEFAULT
+        );
+
+    if (
+        curl_init !=
+        CURLE_OK
+    ) {
+        printf(
+            "curl init failed: %d\n",
+            (int)curl_init
+        );
+
+        consoleUpdate(NULL);
+
+        while (
+            appletMainLoop()
+        ) {
+            padUpdate(
+                &pad
+            );
+
+            if (
+                padGetButtonsDown(
+                    &pad
+                ) &
+                HidNpadButton_Plus
+            ) {
+                break;
+            }
+        }
+
+        socketExit();
+        consoleExit(NULL);
+
+        return 0;
+    }
+
+    if (
+        !downloader_init(
+            "",
+            g_alldebrid_name,
+            g_max_concurrent
+        )
+    ) {
+        printf(
+            "Downloader worker startup failed.\n"
+        );
+
+        consoleUpdate(NULL);
+
+        curl_global_cleanup();
+        socketExit();
+        consoleExit(NULL);
+
+        return 0;
+    }
+
+    int server =
+        socket(
+            AF_INET,
+            SOCK_STREAM,
+            0
+        );
+
+    if (server < 0) {
+        printf(
+            "socket failed: %d\n",
+            errno
+        );
+
+        curl_global_cleanup();
+        socketExit();
+        consoleExit(NULL);
+
+        return 0;
+    }
+
+    int yes = 1;
+
+    setsockopt(
+        server,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &yes,
+        sizeof(yes)
+    );
+
+    struct sockaddr_in addr;
+
+    memset(
+        &addr,
+        0,
+        sizeof(addr)
+    );
+
+    addr.sin_family =
+        AF_INET;
+
+    addr.sin_port =
+        htons(PORT);
+
+    addr.sin_addr.s_addr =
+        INADDR_ANY;
+
+    if (
+        bind(
+            server,
+            (struct sockaddr *)&addr,
+            sizeof(addr)
+        ) != 0 ||
+        listen(
+            server,
+            8
+        ) != 0
+    ) {
+        printf(
+            "Server startup failed: %d\n",
+            errno
+        );
+
+        consoleUpdate(NULL);
+
+        while (
+            appletMainLoop()
+        ) {
+            padUpdate(
+                &pad
+            );
+
+            if (
+                padGetButtonsDown(
+                    &pad
+                ) &
+                HidNpadButton_Plus
+            ) {
+                break;
+            }
+        }
+
+        close(server);
+        downloader_shutdown();
+        curl_global_cleanup();
+        socketExit();
+        consoleExit(NULL);
+
+        return 0;
+    }
+
+    printf(
+        "READY\n\n"
+        "Phone:\n"
+        "http://SWITCH-IP:%d\n\n"
+
+        "AllDebrid token: %s\n"
+        "Max concurrent: %d\n\n"
+
+        "Press + to exit.\n",
+
+        PORT,
+
+        g_alldebrid_token[0]
+            ? "loaded"
+            : "not configured",
+
+        g_max_concurrent
+    );
+
+    consoleUpdate(NULL);
+
+    while (
+        appletMainLoop()
+    ) {
+        padUpdate(
+            &pad
+        );
+
+        if (
+            padGetButtonsDown(
+                &pad
+            ) &
+            HidNpadButton_Plus
+        ) {
+            break;
+        }
+
+        fd_set fds;
+
+        FD_ZERO(
+            &fds
+        );
+
+        FD_SET(
+            server,
+            &fds
+        );
+
+        struct timeval tv = {
+            .tv_sec = 0,
+            .tv_usec = 100000
+        };
+
+        int ready =
+            select(
+                server + 1,
+                &fds,
+                NULL,
+                NULL,
+                &tv
+            );
+
+        if (
+            ready > 0 &&
+            FD_ISSET(
+                server,
+                &fds
+            )
+        ) {
+            struct sockaddr_in client_addr;
+            socklen_t client_addr_len =
+                sizeof(client_addr);
+
+            memset(
+                &client_addr,
+                0,
+                sizeof(client_addr)
+            );
+
+            int client =
+                accept(
+                    server,
+                    (struct sockaddr *)&client_addr,
+                    &client_addr_len
+                );
+
+            char client_ip[
+                INET_ADDRSTRLEN
+            ] = {0};
+
+            if (
+                client >= 0
+            ) {
+                if (
+                    !inet_ntop(
+                        AF_INET,
+                        &client_addr.sin_addr,
+                        client_ip,
+                        sizeof(client_ip)
+                    )
+                ) {
+                    snprintf(
+                        client_ip,
+                        sizeof(client_ip),
+                        "unknown"
+                    );
+                }
+                struct timeval timeout;
+
+                timeout.tv_sec = 35;
+                timeout.tv_usec = 0;
+
+                setsockopt(
+                    client,
+                    SOL_SOCKET,
+                    SO_RCVTIMEO,
+                    &timeout,
+                    sizeof(timeout)
+                );
+
+                setsockopt(
+                    client,
+                    SOL_SOCKET,
+                    SO_SNDTIMEO,
+                    &timeout,
+                    sizeof(timeout)
+                );
+
+                handle_client(
+                    client,
+                    client_ip
+                );
+
+                close(
+                    client
+                );
+            }
+        }
+    }
+
+    close(
+        server
+    );
+
+    alldebrid_pin_reset();
+
+    downloader_set_token(
+        ""
+    );
+
+    g_alldebrid_connected =
+        false;
+
+    remote_auth_revoke_all();
+
+    downloader_shutdown();
+
+    curl_global_cleanup();
+
+    socketExit();
+
+    consoleExit(NULL);
+
+    return 0;
+}

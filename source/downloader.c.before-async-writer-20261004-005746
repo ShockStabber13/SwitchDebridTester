@@ -1,0 +1,7483 @@
+#include "downloader.h"
+#include "archive_extract.h"
+
+#include <switch.h>
+#include <curl/curl.h>
+
+#include <ctype.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#define MAX_WORKERS 4
+#define MAX_QUEUE 128
+
+#define API_BODY_MAX 65536
+
+#define DOWNLOAD_IO_BUFFER_SIZE (8 * 1024 * 1024)
+#if LIBCURL_VERSION_NUM >= 0x075800
+#define CURL_RECV_BUFFER_SIZE (4 * 1024 * 1024L)
+#else
+#define CURL_RECV_BUFFER_SIZE (512 * 1024L)
+#endif
+
+#define DOWNLOAD_DIR \
+    "sdmc:/switch/SwitchDebridDownloader/downloads"
+
+#define CONFIG_DIR \
+    "sdmc:/config/SwitchDebridDownloader"
+
+#define COMPLETED_LOG \
+    "sdmc:/config/SwitchDebridDownloader/completed.log"
+
+#define FAILED_LOG \
+    "sdmc:/config/SwitchDebridDownloader/failed.log"
+
+
+typedef struct {
+    char *items[MAX_QUEUE];
+    int head;
+    int tail;
+    int count;
+} JobQueue;
+
+
+typedef struct {
+    bool active;
+
+    unsigned long long downloaded;
+    unsigned long long total;
+
+    unsigned long long bytes_per_second;
+    unsigned long long last_downloaded;
+
+    struct timespec last_time;
+
+    char filename[1024];
+} WorkerProgress;
+
+
+typedef struct {
+    FILE *file;
+    int worker_index;
+
+    unsigned char *io_buffer;
+    size_t io_used;
+    size_t io_capacity;
+    bool io_failed;
+} DownloadContext;
+
+
+typedef struct {
+    bool success;
+
+    char filename[1024];
+    char direct_url[8192];
+
+    unsigned long long filesize;
+    unsigned long long delayed;
+
+    char error[512];
+} UnlockResult;
+
+
+typedef struct {
+    char *data;
+    size_t size;
+    size_t capacity;
+    bool overflow;
+} ApiBuffer;
+
+
+static Mutex g_mutex;
+
+static JobQueue g_queue;
+
+static Thread g_threads[MAX_WORKERS];
+static int g_thread_count = 0;
+
+static WorkerProgress
+    g_worker_progress[MAX_WORKERS];
+
+static volatile bool g_running = false;
+
+static char g_token[1024];
+static char g_user_agent[256];
+
+static int g_completed = 0;
+static int g_failed = 0;
+
+
+/* ========================================================= */
+/* Helpers                                                   */
+/* ========================================================= */
+
+static void ensure_directories(void)
+{
+    mkdir(
+        "sdmc:/switch",
+        0777
+    );
+
+    mkdir(
+        "sdmc:/switch/SwitchDebridDownloader",
+        0777
+    );
+
+    mkdir(
+        DOWNLOAD_DIR,
+        0777
+    );
+
+    mkdir(
+        "sdmc:/config",
+        0777
+    );
+
+    mkdir(
+        CONFIG_DIR,
+        0777
+    );
+}
+
+
+static char *duplicate_string(
+    const char *text
+)
+{
+    size_t len =
+        strlen(text);
+
+    char *copy =
+        malloc(
+            len + 1
+        );
+
+    if (!copy)
+        return NULL;
+
+    memcpy(
+        copy,
+        text,
+        len + 1
+    );
+
+    return copy;
+}
+
+
+static void append_log(
+    const char *path,
+    const char *url,
+    const char *message
+)
+{
+    FILE *f =
+        fopen(
+            path,
+            "a"
+        );
+
+    if (!f)
+        return;
+
+    fprintf(
+        f,
+        "%s\t%s\n",
+        message ? message : "",
+        url ? url : ""
+    );
+
+    fclose(f);
+}
+
+
+static const char *skip_space(
+    const char *p
+)
+{
+    while (
+        *p == ' ' ||
+        *p == '\t' ||
+        *p == '\r' ||
+        *p == '\n'
+    ) {
+        p++;
+    }
+
+    return p;
+}
+
+
+/* ========================================================= */
+/* Small JSON parser                                         */
+/* ========================================================= */
+
+static bool json_string(
+    const char *json,
+    const char *key,
+    char *output,
+    size_t output_size
+)
+{
+    char needle[128];
+
+    snprintf(
+        needle,
+        sizeof(needle),
+        "\"%s\"",
+        key
+    );
+
+    const char *p =
+        strstr(
+            json,
+            needle
+        );
+
+    if (!p)
+        return false;
+
+    p += strlen(needle);
+    p = skip_space(p);
+
+    if (*p != ':')
+        return false;
+
+    p++;
+    p = skip_space(p);
+
+    if (*p != '"')
+        return false;
+
+    p++;
+
+    size_t out = 0;
+
+    while (
+        *p &&
+        *p != '"' &&
+        out + 1 < output_size
+    ) {
+        if (*p == '\\') {
+            p++;
+
+            if (!*p)
+                break;
+
+            switch (*p) {
+                case '"':
+                    output[out++] = '"';
+                    break;
+
+                case '\\':
+                    output[out++] = '\\';
+                    break;
+
+                case '/':
+                    output[out++] = '/';
+                    break;
+
+                case 'n':
+                    output[out++] = '\n';
+                    break;
+
+                case 'r':
+                    output[out++] = '\r';
+                    break;
+
+                case 't':
+                    output[out++] = '\t';
+                    break;
+
+                default:
+                    output[out++] = *p;
+                    break;
+            }
+
+            p++;
+            continue;
+        }
+
+        output[out++] =
+            *p++;
+    }
+
+    output[out] = '\0';
+
+    return true;
+}
+
+
+static bool json_u64(
+    const char *json,
+    const char *key,
+    unsigned long long *value
+)
+{
+    char needle[128];
+
+    snprintf(
+        needle,
+        sizeof(needle),
+        "\"%s\"",
+        key
+    );
+
+    const char *p =
+        strstr(
+            json,
+            needle
+        );
+
+    if (!p)
+        return false;
+
+    p += strlen(needle);
+    p = skip_space(p);
+
+    if (*p != ':')
+        return false;
+
+    p++;
+    p = skip_space(p);
+
+    if (
+        *p < '0' ||
+        *p > '9'
+    ) {
+        return false;
+    }
+
+    *value =
+        strtoull(
+            p,
+            NULL,
+            10
+        );
+
+    return true;
+}
+
+
+static bool api_success(
+    const char *json
+)
+{
+    char status[32];
+
+    if (
+        !json_string(
+            json,
+            "status",
+            status,
+            sizeof(status)
+        )
+    ) {
+        return false;
+    }
+
+    return
+        strcmp(
+            status,
+            "success"
+        ) == 0;
+}
+
+
+/* ========================================================= */
+/* API buffering                                             */
+/* ========================================================= */
+
+static size_t api_write(
+    char *ptr,
+    size_t size,
+    size_t nmemb,
+    void *userdata
+)
+{
+    ApiBuffer *buffer =
+        (ApiBuffer *)userdata;
+
+    size_t amount =
+        size * nmemb;
+
+    if (
+        buffer->size +
+        amount +
+        1 >
+        buffer->capacity
+    ) {
+        buffer->overflow =
+            true;
+
+        return 0;
+    }
+
+    memcpy(
+        buffer->data +
+        buffer->size,
+        ptr,
+        amount
+    );
+
+    buffer->size += amount;
+
+    buffer->data[
+        buffer->size
+    ] = '\0';
+
+    return amount;
+}
+
+
+static void configure_common_curl(
+    CURL *curl
+)
+{
+    curl_easy_setopt(
+        curl,
+        CURLOPT_CONNECTTIMEOUT,
+        20L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_TIMEOUT,
+        60L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOSIGNAL,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYPEER,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYHOST,
+        2L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_USERAGENT,
+        g_user_agent[0]
+            ? g_user_agent
+            : "SwitchDebridDownloader"
+    );
+}
+
+
+static struct curl_slist *
+make_auth_headers(void)
+{
+    char auth[1200];
+
+    snprintf(
+        auth,
+        sizeof(auth),
+        "Authorization: Bearer %s",
+        g_token
+    );
+
+    struct curl_slist *headers =
+        NULL;
+
+    headers =
+        curl_slist_append(
+            headers,
+            auth
+        );
+
+    headers =
+        curl_slist_append(
+            headers,
+            "Content-Type: application/x-www-form-urlencoded"
+        );
+
+    return headers;
+}
+
+
+static bool form_encode(
+    const char *input,
+    char **output
+)
+{
+    size_t input_len =
+        strlen(input);
+
+    size_t capacity =
+        input_len * 3 +
+        1;
+
+    char *encoded =
+        malloc(capacity);
+
+    if (!encoded)
+        return false;
+
+    static const char hex[] =
+        "0123456789ABCDEF";
+
+    size_t out = 0;
+
+    for (
+        size_t i = 0;
+        i < input_len;
+        i++
+    ) {
+        unsigned char c =
+            (unsigned char)input[i];
+
+        if (
+            isalnum(c) ||
+            c == '-' ||
+            c == '_' ||
+            c == '.' ||
+            c == '~'
+        ) {
+            encoded[out++] =
+                (char)c;
+        }
+        else {
+            encoded[out++] = '%';
+            encoded[out++] =
+                hex[
+                    (c >> 4) &
+                    0xF
+                ];
+
+            encoded[out++] =
+                hex[
+                    c & 0xF
+                ];
+        }
+    }
+
+    encoded[out] = '\0';
+
+    *output = encoded;
+
+    return true;
+}
+
+
+static bool api_post(
+    const char *endpoint,
+    const char *post_data,
+    char *response,
+    size_t response_size,
+    long *http_status
+)
+{
+    CURL *curl =
+        curl_easy_init();
+
+    if (!curl)
+        return false;
+
+    ApiBuffer buffer = {
+        .data = response,
+        .size = 0,
+        .capacity = response_size,
+        .overflow = false
+    };
+
+    response[0] = '\0';
+
+    struct curl_slist *headers =
+        make_auth_headers();
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_URL,
+        endpoint
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_HTTPHEADER,
+        headers
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_POST,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_POSTFIELDS,
+        post_data
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEFUNCTION,
+        api_write
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEDATA,
+        &buffer
+    );
+
+    configure_common_curl(
+        curl
+    );
+
+    CURLcode rc =
+        curl_easy_perform(
+            curl
+        );
+
+    *http_status = 0;
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_RESPONSE_CODE,
+        http_status
+    );
+
+    curl_easy_cleanup(
+        curl
+    );
+
+    if (headers)
+        curl_slist_free_all(
+            headers
+        );
+
+    return
+        rc == CURLE_OK &&
+        !buffer.overflow;
+}
+
+
+/* ========================================================= */
+/* AllDebrid unlock + delayed flow                           */
+/* ========================================================= */
+
+static bool poll_delayed(
+    unsigned long long delayed_id,
+    char *direct_url,
+    size_t direct_url_size,
+    char *error,
+    size_t error_size
+)
+{
+    char *response =
+        malloc(
+            API_BODY_MAX
+        );
+
+    if (!response) {
+        snprintf(
+            error,
+            error_size,
+            "Out of memory"
+        );
+
+        return false;
+    }
+
+    for (
+        int attempt = 0;
+        attempt < 60 &&
+        g_running;
+        attempt++
+    ) {
+        /*
+         * AllDebrid requests at least five seconds
+         * between delayed-link status checks.
+         */
+        svcSleepThread(
+            5LL *
+            1000LL *
+            1000LL *
+            1000LL
+        );
+
+        char post_data[128];
+
+        snprintf(
+            post_data,
+            sizeof(post_data),
+            "id=%llu",
+            delayed_id
+        );
+
+        long status = 0;
+
+        bool request_ok =
+            api_post(
+                "https://api.alldebrid.com/v4/link/delayed",
+                post_data,
+                response,
+                API_BODY_MAX,
+                &status
+            );
+
+        if (
+            !request_ok ||
+            status != 200 ||
+            !api_success(response)
+        ) {
+            snprintf(
+                error,
+                error_size,
+                "Delayed-link API error"
+            );
+
+            free(response);
+            return false;
+        }
+
+        const char *data =
+            strstr(
+                response,
+                "\"data\""
+            );
+
+        if (!data)
+            data = response;
+
+        unsigned long long
+            delayed_status = 0;
+
+        if (
+            !json_u64(
+                data,
+                "status",
+                &delayed_status
+            )
+        ) {
+            snprintf(
+                error,
+                error_size,
+                "Invalid delayed-link response"
+            );
+
+            free(response);
+            return false;
+        }
+
+        if (
+            delayed_status == 2
+        ) {
+            bool found =
+                json_string(
+                    data,
+                    "link",
+                    direct_url,
+                    direct_url_size
+                );
+
+            free(response);
+
+            if (
+                !found ||
+                !direct_url[0]
+            ) {
+                snprintf(
+                    error,
+                    error_size,
+                    "Delayed link ready but URL missing"
+                );
+
+                return false;
+            }
+
+            return true;
+        }
+
+        if (
+            delayed_status == 3
+        ) {
+            snprintf(
+                error,
+                error_size,
+                "AllDebrid could not generate link"
+            );
+
+            free(response);
+            return false;
+        }
+    }
+
+    free(response);
+
+    snprintf(
+        error,
+        error_size,
+        "Delayed-link timeout"
+    );
+
+    return false;
+}
+
+
+static bool unlock_link(
+    const char *source_url,
+    UnlockResult *result
+)
+{
+    memset(
+        result,
+        0,
+        sizeof(*result)
+    );
+
+    char *encoded = NULL;
+
+    if (
+        !form_encode(
+            source_url,
+            &encoded
+        )
+    ) {
+        snprintf(
+            result->error,
+            sizeof(result->error),
+            "Could not encode source URL"
+        );
+
+        return false;
+    }
+
+    size_t post_size =
+        strlen(encoded) +
+        16;
+
+    char *post_data =
+        malloc(
+            post_size
+        );
+
+    if (!post_data) {
+        free(encoded);
+
+        snprintf(
+            result->error,
+            sizeof(result->error),
+            "Out of memory"
+        );
+
+        return false;
+    }
+
+    snprintf(
+        post_data,
+        post_size,
+        "link=%s",
+        encoded
+    );
+
+    free(encoded);
+
+    char *response =
+        malloc(
+            API_BODY_MAX
+        );
+
+    if (!response) {
+        free(post_data);
+
+        snprintf(
+            result->error,
+            sizeof(result->error),
+            "Out of memory"
+        );
+
+        return false;
+    }
+
+    long status = 0;
+
+    bool request_ok =
+        api_post(
+            "https://api.alldebrid.com/v4/link/unlock",
+            post_data,
+            response,
+            API_BODY_MAX,
+            &status
+        );
+
+    free(post_data);
+
+    if (
+        !request_ok ||
+        status != 200 ||
+        !api_success(response)
+    ) {
+        char code[128] = {0};
+        char message[256] = {0};
+
+        json_string(
+            response,
+            "code",
+            code,
+            sizeof(code)
+        );
+
+        json_string(
+            response,
+            "message",
+            message,
+            sizeof(message)
+        );
+
+        snprintf(
+            result->error,
+            sizeof(result->error),
+            "%s%s%s",
+            code[0]
+                ? code
+                : "Unlock failed",
+            message[0]
+                ? ": "
+                : "",
+            message
+        );
+
+        free(response);
+
+        return false;
+    }
+
+    const char *data =
+        strstr(
+            response,
+            "\"data\""
+        );
+
+    if (!data)
+        data = response;
+
+    json_string(
+        data,
+        "filename",
+        result->filename,
+        sizeof(result->filename)
+    );
+
+    json_u64(
+        data,
+        "filesize",
+        &result->filesize
+    );
+
+    if (
+        json_string(
+            data,
+            "link",
+            result->direct_url,
+            sizeof(result->direct_url)
+        ) &&
+        result->direct_url[0]
+    ) {
+        result->success = true;
+
+        free(response);
+
+        return true;
+    }
+
+    json_u64(
+        data,
+        "delayed",
+        &result->delayed
+    );
+
+    free(response);
+
+    if (
+        result->delayed > 0
+    ) {
+        if (
+            poll_delayed(
+                result->delayed,
+                result->direct_url,
+                sizeof(result->direct_url),
+                result->error,
+                sizeof(result->error)
+            )
+        ) {
+            result->success = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    snprintf(
+        result->error,
+        sizeof(result->error),
+        "No download URL returned"
+    );
+
+    return false;
+}
+
+
+
+/* ========================================================= */
+/* Direct URL preparation                                    */
+/* ========================================================= */
+
+typedef struct {
+    char filename[1024];
+    unsigned long long content_length;
+    unsigned long long content_range_total;
+} DirectProbeInfo;
+
+
+typedef struct {
+    size_t received;
+    size_t limit;
+} DirectProbeBody;
+
+
+static int hex_value(
+    char c
+)
+{
+    if (
+        c >= '0' &&
+        c <= '9'
+    )
+        return c - '0';
+
+    if (
+        c >= 'a' &&
+        c <= 'f'
+    )
+        return c - 'a' + 10;
+
+    if (
+        c >= 'A' &&
+        c <= 'F'
+    )
+        return c - 'A' + 10;
+
+    return -1;
+}
+
+
+static void percent_decode_in_place(
+    char *text
+)
+{
+    char *src = text;
+    char *dst = text;
+
+    while (*src) {
+        if (
+            src[0] == '%' &&
+            src[1] &&
+            src[2]
+        ) {
+            int hi =
+                hex_value(
+                    src[1]
+                );
+
+            int lo =
+                hex_value(
+                    src[2]
+                );
+
+            if (
+                hi >= 0 &&
+                lo >= 0
+            ) {
+                *dst++ =
+                    (char)(
+                        (hi << 4) |
+                        lo
+                    );
+
+                src += 3;
+                continue;
+            }
+        }
+
+        *dst++ = *src++;
+    }
+
+    *dst = '\0';
+}
+
+
+static const char *case_find(
+    const char *haystack,
+    const char *needle
+)
+{
+    size_t needle_len =
+        strlen(needle);
+
+    if (!needle_len)
+        return haystack;
+
+    for (
+        const char *p = haystack;
+        *p;
+        p++
+    ) {
+        if (
+            strncasecmp(
+                p,
+                needle,
+                needle_len
+            ) == 0
+        ) {
+            return p;
+        }
+    }
+
+    return NULL;
+}
+
+
+static void direct_copy_filename(
+    DirectProbeInfo *info,
+    const char *start,
+    const char *end
+)
+{
+    if (
+        !info ||
+        !start ||
+        !end ||
+        end <= start
+    ) {
+        return;
+    }
+
+    while (
+        start < end &&
+        (
+            *start == ' ' ||
+            *start == '\t' ||
+            *start == '"'
+        )
+    ) {
+        start++;
+    }
+
+    while (
+        end > start &&
+        (
+            end[-1] == ' ' ||
+            end[-1] == '\t' ||
+            end[-1] == '"' ||
+            end[-1] == '\r' ||
+            end[-1] == '\n'
+        )
+    ) {
+        end--;
+    }
+
+    size_t len =
+        (size_t)(end - start);
+
+    if (
+        !len ||
+        len >= sizeof(info->filename)
+    ) {
+        return;
+    }
+
+    memcpy(
+        info->filename,
+        start,
+        len
+    );
+
+    info->filename[len] =
+        '\0';
+
+    percent_decode_in_place(
+        info->filename
+    );
+}
+
+
+static size_t direct_probe_header(
+    char *buffer,
+    size_t size,
+    size_t nmemb,
+    void *userdata
+)
+{
+    DirectProbeInfo *info =
+        (DirectProbeInfo *)userdata;
+
+    size_t bytes =
+        size * nmemb;
+
+    if (
+        !info ||
+        bytes == 0
+    ) {
+        return bytes;
+    }
+
+    char line[4096];
+
+    size_t copy =
+        bytes < sizeof(line) - 1
+            ? bytes
+            : sizeof(line) - 1;
+
+    memcpy(
+        line,
+        buffer,
+        copy
+    );
+
+    line[copy] = '\0';
+
+    /* A redirect can produce several header blocks. Keep only
+     * metadata from the most recent HTTP response. */
+    if (
+        strncasecmp(
+            line,
+            "HTTP/",
+            5
+        ) == 0
+    ) {
+        info->filename[0] = '\0';
+        info->content_length = 0;
+        info->content_range_total = 0;
+        return bytes;
+    }
+
+    if (
+        strncasecmp(
+            line,
+            "Content-Disposition:",
+            20
+        ) == 0
+    ) {
+        const char *p =
+            case_find(
+                line,
+                "filename*="
+            );
+
+        if (p) {
+            p += 10;
+
+            const char *value = p;
+
+            const char *ticks =
+                strstr(
+                    value,
+                    "''"
+                );
+
+            if (ticks)
+                value =
+                    ticks + 2;
+
+            const char *end = value;
+
+            while (
+                *end &&
+                *end != ';' &&
+                *end != '\r' &&
+                *end != '\n'
+            ) {
+                end++;
+            }
+
+            direct_copy_filename(
+                info,
+                value,
+                end
+            );
+        }
+
+        if (!info->filename[0]) {
+            p =
+                case_find(
+                    line,
+                    "filename="
+                );
+
+            if (p) {
+                p += 9;
+
+                const char *end = p;
+
+                if (*p == '"') {
+                    p++;
+                    end =
+                        strchr(
+                            p,
+                            '"'
+                        );
+
+                    if (!end)
+                        end =
+                            p + strlen(p);
+                }
+                else {
+                    while (
+                        *end &&
+                        *end != ';' &&
+                        *end != '\r' &&
+                        *end != '\n'
+                    ) {
+                        end++;
+                    }
+                }
+
+                direct_copy_filename(
+                    info,
+                    p,
+                    end
+                );
+            }
+        }
+    }
+    else if (
+        strncasecmp(
+            line,
+            "Content-Range:",
+            14
+        ) == 0
+    ) {
+        const char *slash =
+            strrchr(
+                line,
+                '/'
+            );
+
+        if (
+            slash &&
+            slash[1] >= '0' &&
+            slash[1] <= '9'
+        ) {
+            info->content_range_total =
+                strtoull(
+                    slash + 1,
+                    NULL,
+                    10
+                );
+        }
+    }
+    else if (
+        strncasecmp(
+            line,
+            "Content-Length:",
+            15
+        ) == 0
+    ) {
+        const char *p =
+            line + 15;
+
+        while (
+            *p == ' ' ||
+            *p == '\t'
+        ) {
+            p++;
+        }
+
+        unsigned long long value =
+            strtoull(
+                p,
+                NULL,
+                10
+            );
+
+        if (value > 0)
+            info->content_length =
+                value;
+    }
+
+    return bytes;
+}
+
+
+static size_t direct_probe_write(
+    char *ptr,
+    size_t size,
+    size_t nmemb,
+    void *userdata
+)
+{
+    (void)ptr;
+
+    DirectProbeBody *body =
+        (DirectProbeBody *)userdata;
+
+    size_t bytes =
+        size * nmemb;
+
+    if (!body)
+        return 0;
+
+    size_t remaining =
+        body->received <
+        body->limit
+            ? body->limit -
+              body->received
+            : 0;
+
+    if (!remaining)
+        return 0;
+
+    size_t accepted =
+        bytes < remaining
+            ? bytes
+            : remaining;
+
+    body->received +=
+        accepted;
+
+    return accepted;
+}
+
+
+static bool direct_filename_from_url(
+    const char *url,
+    char *filename,
+    size_t filename_size
+)
+{
+    if (
+        !url ||
+        !url[0] ||
+        !filename ||
+        filename_size == 0
+    ) {
+        return false;
+    }
+
+    const char *end =
+        url + strlen(url);
+
+    const char *query =
+        strchr(
+            url,
+            '?'
+        );
+
+    if (
+        query &&
+        query < end
+    )
+        end = query;
+
+    const char *fragment =
+        strchr(
+            url,
+            '#'
+        );
+
+    if (
+        fragment &&
+        fragment < end
+    )
+        end = fragment;
+
+    const char *start = end;
+
+    while (
+        start > url &&
+        start[-1] != '/'
+    ) {
+        start--;
+    }
+
+    if (
+        start >= end ||
+        *start == '\0'
+    ) {
+        return false;
+    }
+
+    size_t len =
+        (size_t)(end - start);
+
+    if (len >= filename_size)
+        len =
+            filename_size - 1;
+
+    memcpy(
+        filename,
+        start,
+        len
+    );
+
+    filename[len] =
+        '\0';
+
+    percent_decode_in_place(
+        filename
+    );
+
+    return
+        filename[0] != '\0';
+}
+
+
+static void make_unconfirmed_name(
+    int worker_index,
+    char *filename,
+    size_t filename_size
+)
+{
+    struct timespec now;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &now
+    );
+
+    unsigned long long number =
+        (
+            (unsigned long long)now.tv_nsec +
+            (unsigned long long)now.tv_sec *
+                997ULL +
+            (unsigned long long)
+                (worker_index + 1) *
+                7919ULL
+        ) %
+        1000000ULL;
+
+    snprintf(
+        filename,
+        filename_size,
+        "Unconfirmed %06llu.crdownload",
+        number
+    );
+}
+
+
+static void direct_probe_request(
+    const char *url,
+    bool head_only,
+    DirectProbeInfo *info,
+    char *effective_url,
+    size_t effective_url_size
+)
+{
+    CURL *curl =
+        curl_easy_init();
+
+    if (!curl)
+        return;
+
+    DirectProbeBody body = {
+        .received = 0,
+        .limit = 1
+    };
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_URL,
+        url
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FOLLOWLOCATION,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_MAXREDIRS,
+        10L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_HEADERFUNCTION,
+        direct_probe_header
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_HEADERDATA,
+        info
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_CONNECTTIMEOUT,
+        20L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_TIMEOUT,
+        30L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOSIGNAL,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYPEER,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYHOST,
+        2L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_USERAGENT,
+        g_user_agent[0]
+            ? g_user_agent
+            : "SwitchDebridDownloader"
+    );
+
+    if (head_only) {
+        curl_easy_setopt(
+            curl,
+            CURLOPT_NOBODY,
+            1L
+        );
+    }
+    else {
+        curl_easy_setopt(
+            curl,
+            CURLOPT_RANGE,
+            "0-0"
+        );
+
+        curl_easy_setopt(
+            curl,
+            CURLOPT_WRITEFUNCTION,
+            direct_probe_write
+        );
+
+        curl_easy_setopt(
+            curl,
+            CURLOPT_WRITEDATA,
+            &body
+        );
+    }
+
+    (void)curl_easy_perform(
+        curl
+    );
+
+    const char *effective =
+        NULL;
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_EFFECTIVE_URL,
+        &effective
+    );
+
+    if (
+        effective &&
+        effective[0] &&
+        effective_url &&
+        effective_url_size > 0
+    ) {
+        snprintf(
+            effective_url,
+            effective_url_size,
+            "%s",
+            effective
+        );
+    }
+
+    curl_easy_cleanup(
+        curl
+    );
+}
+
+
+static bool prepare_direct_link(
+    int worker_index,
+    const char *source_url,
+    UnlockResult *result
+)
+{
+    memset(
+        result,
+        0,
+        sizeof(*result)
+    );
+
+    if (
+        !source_url ||
+        (
+            strncasecmp(
+                source_url,
+                "http://",
+                7
+            ) != 0 &&
+            strncasecmp(
+                source_url,
+                "https://",
+                8
+            ) != 0
+        )
+    ) {
+        snprintf(
+            result->error,
+            sizeof(result->error),
+            "Direct mode requires an http:// or https:// URL"
+        );
+
+        return false;
+    }
+
+    snprintf(
+        result->direct_url,
+        sizeof(result->direct_url),
+        "%s",
+        source_url
+    );
+
+    DirectProbeInfo info;
+
+    memset(
+        &info,
+        0,
+        sizeof(info)
+    );
+
+    char effective_url[8192] = {0};
+
+    direct_probe_request(
+        source_url,
+        true,
+        &info,
+        effective_url,
+        sizeof(effective_url)
+    );
+
+    if (
+        !info.filename[0] ||
+        (
+            info.content_length == 0 &&
+            info.content_range_total == 0
+        )
+    ) {
+        direct_probe_request(
+            source_url,
+            false,
+            &info,
+            effective_url,
+            sizeof(effective_url)
+        );
+    }
+
+    if (info.filename[0]) {
+        snprintf(
+            result->filename,
+            sizeof(result->filename),
+            "%s",
+            info.filename
+        );
+    }
+    else if (
+        effective_url[0] &&
+        direct_filename_from_url(
+            effective_url,
+            result->filename,
+            sizeof(result->filename)
+        )
+    ) {
+    }
+    else if (
+        direct_filename_from_url(
+            source_url,
+            result->filename,
+            sizeof(result->filename)
+        )
+    ) {
+    }
+    else {
+        make_unconfirmed_name(
+            worker_index,
+            result->filename,
+            sizeof(result->filename)
+        );
+    }
+
+    result->filesize =
+        info.content_range_total
+            ? info.content_range_total
+            : info.content_length;
+
+    result->success = true;
+
+    return true;
+}
+
+
+/* ========================================================= */
+/* File download                                             */
+/* ========================================================= */
+
+static void sanitize_filename(
+    char *name
+)
+{
+    if (!name[0]) {
+        snprintf(
+            name,
+            1024,
+            "download.bin"
+        );
+
+        return;
+    }
+
+    for (
+        char *p = name;
+        *p;
+        p++
+    ) {
+        unsigned char c =
+            (unsigned char)*p;
+
+        if (
+            c < 32 ||
+            *p == '/' ||
+            *p == '\\' ||
+            *p == ':' ||
+            *p == '*' ||
+            *p == '?' ||
+            *p == '"' ||
+            *p == '<' ||
+            *p == '>' ||
+            *p == '|'
+        ) {
+            *p = '_';
+        }
+    }
+}
+
+
+static void choose_output_path(
+    const char *filename,
+    char *final_path,
+    size_t final_size,
+    char *part_path,
+    size_t part_size
+)
+{
+    snprintf(
+        final_path,
+        final_size,
+        "%s/%s",
+        DOWNLOAD_DIR,
+        filename
+    );
+
+    struct stat st;
+
+    if (
+        stat(
+            final_path,
+            &st
+        ) == 0
+    ) {
+        for (
+            int i = 2;
+            i < 1000;
+            i++
+        ) {
+            snprintf(
+                final_path,
+                final_size,
+                "%s/%s.%d",
+                DOWNLOAD_DIR,
+                filename,
+                i
+            );
+
+            if (
+                stat(
+                    final_path,
+                    &st
+                ) != 0
+            ) {
+                break;
+            }
+        }
+    }
+
+    snprintf(
+        part_path,
+        part_size,
+        "%s.part",
+        final_path
+    );
+}
+
+
+static size_t buffered_file_write(
+    FILE *file,
+    unsigned char *buffer,
+    size_t *used,
+    size_t capacity,
+    bool *failed,
+    const char *data,
+    size_t bytes
+)
+{
+    if (
+        !file ||
+        !buffer ||
+        !used ||
+        !failed ||
+        capacity == 0 ||
+        *failed
+    ) {
+        return 0;
+    }
+
+    size_t consumed = 0;
+
+    while (consumed < bytes) {
+        size_t available =
+            capacity - *used;
+
+        size_t remaining =
+            bytes - consumed;
+
+        size_t copy =
+            remaining < available
+                ? remaining
+                : available;
+
+        memcpy(
+            buffer + *used,
+            data + consumed,
+            copy
+        );
+
+        *used += copy;
+        consumed += copy;
+
+        if (*used == capacity) {
+            if (
+                fwrite(
+                    buffer,
+                    1,
+                    *used,
+                    file
+                ) != *used
+            ) {
+                *failed = true;
+                return 0;
+            }
+
+            *used = 0;
+        }
+    }
+
+    return bytes;
+}
+
+
+static bool buffered_file_flush(
+    FILE *file,
+    unsigned char *buffer,
+    size_t *used,
+    bool *failed
+)
+{
+    if (
+        !file ||
+        !buffer ||
+        !used ||
+        !failed ||
+        *failed
+    ) {
+        return false;
+    }
+
+    if (*used > 0) {
+        if (
+            fwrite(
+                buffer,
+                1,
+                *used,
+                file
+            ) != *used
+        ) {
+            *failed = true;
+            return false;
+        }
+
+        *used = 0;
+    }
+
+    return true;
+}
+
+
+static size_t file_write_callback(
+    char *ptr,
+    size_t size,
+    size_t nmemb,
+    void *userdata
+)
+{
+    DownloadContext *ctx =
+        (DownloadContext *)userdata;
+
+    size_t bytes =
+        size * nmemb;
+
+    return
+        buffered_file_write(
+            ctx->file,
+            ctx->io_buffer,
+            &ctx->io_used,
+            ctx->io_capacity,
+            &ctx->io_failed,
+            ptr,
+            bytes
+        );
+}
+
+
+static int progress_callback(
+    void *clientp,
+    curl_off_t dltotal,
+    curl_off_t dlnow,
+    curl_off_t ultotal,
+    curl_off_t ulnow
+)
+{
+    (void)ultotal;
+    (void)ulnow;
+
+    DownloadContext *ctx =
+        (DownloadContext *)clientp;
+
+    mutexLock(
+        &g_mutex
+    );
+
+    g_worker_progress[
+        ctx->worker_index
+    ].downloaded =
+        dlnow >= 0
+            ? (unsigned long long)dlnow
+            : 0;
+
+    g_worker_progress[
+        ctx->worker_index
+    ].total =
+        dltotal >= 0
+            ? (unsigned long long)dltotal
+            : 0;
+
+    struct timespec now;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &now
+    );
+
+    WorkerProgress *wp =
+        &g_worker_progress[
+            ctx->worker_index
+        ];
+
+    if (
+        wp->last_time.tv_sec != 0 ||
+        wp->last_time.tv_nsec != 0
+    ) {
+        double elapsed =
+            (double)(
+                now.tv_sec -
+                wp->last_time.tv_sec
+            ) +
+            (double)(
+                now.tv_nsec -
+                wp->last_time.tv_nsec
+            ) /
+            1000000000.0;
+
+        if (elapsed >= 0.5) {
+            unsigned long long current =
+                dlnow >= 0
+                    ? (unsigned long long)dlnow
+                    : 0;
+
+            unsigned long long delta =
+                current >= wp->last_downloaded
+                    ? current - wp->last_downloaded
+                    : 0;
+
+            wp->bytes_per_second =
+                (unsigned long long)(
+                    (double)delta /
+                    elapsed
+                );
+
+            wp->last_downloaded =
+                current;
+
+            wp->last_time =
+                now;
+        }
+    }
+    else {
+        wp->last_downloaded =
+            dlnow >= 0
+                ? (unsigned long long)dlnow
+                : 0;
+
+        wp->last_time =
+            now;
+    }
+
+    mutexUnlock(
+        &g_mutex
+    );
+
+    return
+        g_running
+            ? 0
+            : 1;
+}
+
+
+/* ========================================================= */
+/* Four-connection file downloader                           */
+/* ========================================================= */
+
+#define DOWNLOAD_SEGMENTS 5
+
+
+
+
+typedef struct {
+    int worker_index;
+    unsigned long long total;
+    unsigned long long segment_downloaded[DOWNLOAD_SEGMENTS];
+} SegmentedDownloadState;
+
+
+typedef struct {
+    FILE *file;
+    SegmentedDownloadState *state;
+    int segment_index;
+
+    unsigned char *io_buffer;
+    size_t io_used;
+    size_t io_capacity;
+    bool io_failed;
+} SegmentDownloadContext;
+
+
+typedef struct {
+    size_t received;
+    size_t limit;
+} RangeProbeContext;
+
+
+static size_t range_probe_write(
+    char *ptr,
+    size_t size,
+    size_t nmemb,
+    void *userdata
+)
+{
+    (void)ptr;
+
+    RangeProbeContext *ctx =
+        (RangeProbeContext *)userdata;
+
+    size_t bytes =
+        size * nmemb;
+
+    if (
+        bytes > ctx->limit -
+        (
+            ctx->received < ctx->limit
+                ? ctx->received
+                : ctx->limit
+        )
+    ) {
+        return 0;
+    }
+
+    ctx->received += bytes;
+    return bytes;
+}
+
+
+static bool server_supports_byte_ranges(
+    const char *url
+)
+{
+    CURL *curl =
+        curl_easy_init();
+
+    if (!curl)
+        return false;
+
+    RangeProbeContext probe = {
+        .received = 0,
+        .limit = 4096
+    };
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_URL,
+        url
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_RANGE,
+        "0-0"
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FOLLOWLOCATION,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_MAXREDIRS,
+        10L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEFUNCTION,
+        range_probe_write
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEDATA,
+        &probe
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_CONNECTTIMEOUT,
+        30L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_TIMEOUT,
+        30L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOSIGNAL,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYPEER,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYHOST,
+        2L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_USERAGENT,
+        g_user_agent[0]
+            ? g_user_agent
+            : "SwitchDebridDownloader"
+    );
+
+    /*
+     * Do not consume one of the transfer connections from a
+     * persistent pool. The real segmented transfer deliberately
+     * starts four independent TCP connections below.
+     */
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FRESH_CONNECT,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FORBID_REUSE,
+        1L
+    );
+
+    CURLcode rc =
+        curl_easy_perform(
+            curl
+        );
+
+    long http_status = 0;
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_RESPONSE_CODE,
+        &http_status
+    );
+
+    curl_easy_cleanup(
+        curl
+    );
+
+    return
+        rc == CURLE_OK &&
+        http_status == 206 &&
+        probe.received == 1;
+}
+
+
+static size_t segment_file_write_callback(
+    char *ptr,
+    size_t size,
+    size_t nmemb,
+    void *userdata
+)
+{
+    SegmentDownloadContext *ctx =
+        (SegmentDownloadContext *)userdata;
+
+    size_t bytes =
+        size * nmemb;
+
+    return
+        buffered_file_write(
+            ctx->file,
+            ctx->io_buffer,
+            &ctx->io_used,
+            ctx->io_capacity,
+            &ctx->io_failed,
+            ptr,
+            bytes
+        );
+}
+
+
+static int segment_progress_callback(
+    void *clientp,
+    curl_off_t dltotal,
+    curl_off_t dlnow,
+    curl_off_t ultotal,
+    curl_off_t ulnow
+)
+{
+    (void)dltotal;
+    (void)ultotal;
+    (void)ulnow;
+
+    SegmentDownloadContext *ctx =
+        (SegmentDownloadContext *)clientp;
+
+    SegmentedDownloadState *state =
+        ctx->state;
+
+    state->segment_downloaded[
+        ctx->segment_index
+    ] =
+        dlnow >= 0
+            ? (unsigned long long)dlnow
+            : 0;
+
+    unsigned long long aggregate = 0;
+
+    for (
+        int i = 0;
+        i < DOWNLOAD_SEGMENTS;
+        i++
+    ) {
+        aggregate +=
+            state->segment_downloaded[i];
+    }
+
+    struct timespec now;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &now
+    );
+
+    mutexLock(
+        &g_mutex
+    );
+
+    WorkerProgress *wp =
+        &g_worker_progress[
+            state->worker_index
+        ];
+
+    wp->downloaded =
+        aggregate;
+
+    wp->total =
+        state->total;
+
+    if (
+        wp->last_time.tv_sec != 0 ||
+        wp->last_time.tv_nsec != 0
+    ) {
+        double elapsed =
+            (double)(
+                now.tv_sec -
+                wp->last_time.tv_sec
+            ) +
+            (double)(
+                now.tv_nsec -
+                wp->last_time.tv_nsec
+            ) /
+            1000000000.0;
+
+        if (elapsed >= 0.5) {
+            unsigned long long delta =
+                aggregate >= wp->last_downloaded
+                    ? aggregate - wp->last_downloaded
+                    : 0;
+
+            wp->bytes_per_second =
+                (unsigned long long)(
+                    (double)delta /
+                    elapsed
+                );
+
+            wp->last_downloaded =
+                aggregate;
+
+            wp->last_time =
+                now;
+        }
+    }
+    else {
+        wp->last_downloaded =
+            aggregate;
+
+        wp->last_time =
+            now;
+    }
+
+    mutexUnlock(
+        &g_mutex
+    );
+
+    return
+        g_running
+            ? 0
+            : 1;
+}
+
+
+static void remove_segment_files(
+    char paths[DOWNLOAD_SEGMENTS][2144]
+)
+{
+    for (
+        int i = 0;
+        i < DOWNLOAD_SEGMENTS;
+        i++
+    ) {
+        if (paths[i][0]) {
+            remove(
+                paths[i]
+            );
+        }
+    }
+}
+
+
+static bool combine_segment_files(
+    char paths[DOWNLOAD_SEGMENTS][2144],
+    const char *part_path,
+    char *error,
+    size_t error_size
+)
+{
+    FILE *out =
+        fopen(
+            part_path,
+            "wb"
+        );
+
+    if (!out) {
+        snprintf(
+            error,
+            error_size,
+            "Could not create combined .part file"
+        );
+
+        return false;
+    }
+
+    const size_t buffer_size =
+        DOWNLOAD_IO_BUFFER_SIZE;
+
+    unsigned char *buffer =
+        malloc(
+            buffer_size
+        );
+
+    if (!buffer) {
+        fclose(out);
+        remove(part_path);
+
+        snprintf(
+            error,
+            error_size,
+            "Out of memory while combining segments"
+        );
+
+        return false;
+    }
+
+    bool ok = true;
+
+    for (
+        int i = 0;
+        i < DOWNLOAD_SEGMENTS && ok;
+        i++
+    ) {
+        FILE *in =
+            fopen(
+                paths[i],
+                "rb"
+            );
+
+        if (!in) {
+            ok = false;
+            break;
+        }
+
+        while (ok) {
+            size_t got =
+                fread(
+                    buffer,
+                    1,
+                    buffer_size,
+                    in
+                );
+
+            if (got > 0) {
+                if (
+                    fwrite(
+                        buffer,
+                        1,
+                        got,
+                        out
+                    ) != got
+                ) {
+                    ok = false;
+                    break;
+                }
+            }
+
+            if (got < buffer_size) {
+                if (ferror(in))
+                    ok = false;
+
+                break;
+            }
+        }
+
+        fclose(in);
+    }
+
+    free(buffer);
+
+    if (fclose(out) != 0)
+        ok = false;
+
+    if (!ok) {
+        remove(part_path);
+
+        snprintf(
+            error,
+            error_size,
+            "Could not combine downloaded segments"
+        );
+
+        return false;
+    }
+
+    return true;
+}
+
+
+static bool download_file_single(
+    int worker_index,
+    const UnlockResult *unlock,
+    const char *part_path,
+    const char *final_path,
+    char *error,
+    size_t error_size
+)
+{
+    remove(
+        part_path
+    );
+
+    FILE *file =
+        fopen(
+            part_path,
+            "wb"
+        );
+
+    if (!file) {
+        snprintf(
+            error,
+            error_size,
+            "Could not create output file"
+        );
+
+        return false;
+    }
+
+    CURL *curl =
+        curl_easy_init();
+
+    if (!curl) {
+        fclose(file);
+        remove(part_path);
+
+        snprintf(
+            error,
+            error_size,
+            "curl_easy_init failed"
+        );
+
+        return false;
+    }
+
+    DownloadContext ctx = {
+        .file = file,
+        .worker_index =
+            worker_index,
+
+        .io_buffer = NULL,
+        .io_used = 0,
+        .io_capacity =
+            DOWNLOAD_IO_BUFFER_SIZE,
+        .io_failed = false
+    };
+
+    ctx.io_buffer =
+        malloc(
+            ctx.io_capacity
+        );
+
+    if (!ctx.io_buffer) {
+        curl_easy_cleanup(
+            curl
+        );
+
+        fclose(
+            file
+        );
+
+        remove(
+            part_path
+        );
+
+        snprintf(
+            error,
+            error_size,
+            "Could not allocate download I/O buffer"
+        );
+
+        return false;
+    }
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_URL,
+        unlock->direct_url
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_HTTP_VERSION,
+        CURL_HTTP_VERSION_2TLS
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FOLLOWLOCATION,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_MAXREDIRS,
+        10L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEFUNCTION,
+        file_write_callback
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEDATA,
+        &ctx
+    );
+    
+    curl_easy_setopt(
+        curl,
+        CURLOPT_BUFFERSIZE,
+        CURL_RECV_BUFFER_SIZE
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_XFERINFOFUNCTION,
+        progress_callback
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_XFERINFODATA,
+        &ctx
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOPROGRESS,
+        0L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_CONNECTTIMEOUT,
+        30L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_TIMEOUT,
+        0L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_LOW_SPEED_LIMIT,
+        1024L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_LOW_SPEED_TIME,
+        90L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOSIGNAL,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYPEER,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYHOST,
+        2L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FAILONERROR,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_USERAGENT,
+        g_user_agent[0]
+            ? g_user_agent
+            : "SwitchDebridDownloader"
+    );
+
+    CURLcode rc =
+        curl_easy_perform(
+            curl
+        );
+
+    long http_status = 0;
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_RESPONSE_CODE,
+        &http_status
+    );
+
+    bool io_ok =
+        !ctx.io_failed &&
+        buffered_file_flush(
+            ctx.file,
+            ctx.io_buffer,
+            &ctx.io_used,
+            &ctx.io_failed
+        );
+
+    free(
+        ctx.io_buffer
+    );
+
+    ctx.io_buffer = NULL;
+
+    curl_easy_cleanup(
+        curl
+    );
+
+    if (
+        fclose(
+            file
+        ) != 0
+    ) {
+        io_ok = false;
+    }
+
+    if (
+        rc != CURLE_OK ||
+        !io_ok ||
+        (
+            http_status != 200 &&
+            http_status != 206
+        )
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Download failed: curl=%d HTTP=%ld",
+            (int)rc,
+            http_status
+        );
+
+        return false;
+    }
+
+    if (
+        rename(
+            part_path,
+            final_path
+        ) != 0
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Could not finalize downloaded file"
+        );
+
+        return false;
+    }
+
+    if (
+        !archive_extract_if_needed(
+            final_path,
+            error,
+            error_size
+        )
+    ) {
+        return false;
+    }
+
+    return true;
+}
+
+
+static bool download_file_segmented(
+    int worker_index,
+    const UnlockResult *unlock,
+    const char *part_path,
+    const char *final_path,
+    char *error,
+    size_t error_size
+)
+{
+    if (
+        unlock->filesize <
+        DOWNLOAD_SEGMENTS
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "File size unavailable for segmented download"
+        );
+
+        return false;
+    }
+
+    if (
+        !server_supports_byte_ranges(
+            unlock->direct_url
+        )
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Server does not support byte ranges"
+        );
+
+        return false;
+    }
+
+    remove(
+        part_path
+    );
+
+    char segment_paths[
+        DOWNLOAD_SEGMENTS
+    ][2144];
+
+    memset(
+        segment_paths,
+        0,
+        sizeof(segment_paths)
+    );
+
+    FILE *files[
+        DOWNLOAD_SEGMENTS
+    ] = {0};
+
+    CURL *easy[
+        DOWNLOAD_SEGMENTS
+    ] = {0};
+
+    CURLcode results[
+        DOWNLOAD_SEGMENTS
+    ];
+
+    long http_status[
+        DOWNLOAD_SEGMENTS
+    ] = {0};
+
+    unsigned long long expected[
+        DOWNLOAD_SEGMENTS
+    ] = {0};
+
+    char ranges[
+        DOWNLOAD_SEGMENTS
+    ][64];
+
+    SegmentDownloadContext contexts[
+        DOWNLOAD_SEGMENTS
+    ];
+
+    memset(
+        contexts,
+        0,
+        sizeof(contexts)
+    );
+
+    for (
+        int i = 0;
+        i < DOWNLOAD_SEGMENTS;
+        i++
+    ) {
+        results[i] =
+            CURLE_FAILED_INIT;
+    }
+
+    SegmentedDownloadState state;
+
+    memset(
+        &state,
+        0,
+        sizeof(state)
+    );
+
+    state.worker_index =
+        worker_index;
+
+    state.total =
+        unlock->filesize;
+
+    CURLM *multi =
+        curl_multi_init();
+
+    if (!multi) {
+        snprintf(
+            error,
+            error_size,
+            "curl_multi_init failed"
+        );
+
+        return false;
+    }
+
+    /*
+     * True HTTP/2 multiplexing:
+     * all ranged transfers share one TLS/H2 connection.
+     */
+    curl_multi_setopt(
+        multi,
+        CURLMOPT_PIPELINING,
+        CURLPIPE_MULTIPLEX
+    );
+
+    curl_multi_setopt(
+        multi,
+        CURLMOPT_MAX_HOST_CONNECTIONS,
+        1L
+    );
+
+    curl_multi_setopt(
+        multi,
+        CURLMOPT_MAX_TOTAL_CONNECTIONS,
+        1L
+    );
+
+    bool setup_ok = true;
+
+    const unsigned long long base =
+        unlock->filesize /
+        DOWNLOAD_SEGMENTS;
+
+    for (
+        int i = 0;
+        i < DOWNLOAD_SEGMENTS;
+        i++
+    ) {
+        unsigned long long start =
+            (unsigned long long)i *
+            base;
+
+        unsigned long long end =
+            i == DOWNLOAD_SEGMENTS - 1
+                ? unlock->filesize - 1
+                : start + base - 1;
+
+        expected[i] =
+            end - start + 1;
+
+        snprintf(
+            segment_paths[i],
+            sizeof(segment_paths[i]),
+            "%s.seg%d",
+            part_path,
+            i
+        );
+
+        remove(
+            segment_paths[i]
+        );
+
+        files[i] =
+            fopen(
+                segment_paths[i],
+                "wb"
+            );
+
+        if (!files[i]) {
+            setup_ok = false;
+            break;
+        }
+
+        /*
+         * 8 MiB buffering per segment.
+         *
+         * Four segments = about 32 MiB of file buffering.
+         */
+        if (
+            setvbuf(
+                files[i],
+                NULL,
+                _IONBF,
+            0
+            ) != 0
+        ) {
+            setup_ok = false;
+            break;
+        }
+
+        snprintf(
+            ranges[i],
+            sizeof(ranges[i]),
+            "%llu-%llu",
+            start,
+            end
+        );
+
+        contexts[i].file =
+            files[i];
+
+        contexts[i].state =
+            &state;
+
+        contexts[i].segment_index =
+            i;
+
+        contexts[i].io_capacity =
+            DOWNLOAD_IO_BUFFER_SIZE;
+
+        contexts[i].io_used = 0;
+        contexts[i].io_failed = false;
+
+        contexts[i].io_buffer =
+            malloc(
+                contexts[i].io_capacity
+            );
+
+        if (!contexts[i].io_buffer) {
+            setup_ok = false;
+            break;
+        }
+
+        easy[i] =
+            curl_easy_init();
+
+        if (!easy[i]) {
+            setup_ok = false;
+            break;
+        }
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_URL,
+            unlock->direct_url
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_HTTP_VERSION,
+            CURL_HTTP_VERSION_2TLS
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_PIPEWAIT,
+            1L
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_RANGE,
+            ranges[i]
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_FOLLOWLOCATION,
+            1L
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_MAXREDIRS,
+            10L
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_WRITEFUNCTION,
+            segment_file_write_callback
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_WRITEDATA,
+            &contexts[i]
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_BUFFERSIZE,
+            CURL_RECV_BUFFER_SIZE
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_XFERINFOFUNCTION,
+            segment_progress_callback
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_XFERINFODATA,
+            &contexts[i]
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_NOPROGRESS,
+            0L
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_CONNECTTIMEOUT,
+            30L
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_TIMEOUT,
+            0L
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_LOW_SPEED_LIMIT,
+            1024L
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_LOW_SPEED_TIME,
+            90L
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_NOSIGNAL,
+            1L
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_SSL_VERIFYPEER,
+            1L
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_SSL_VERIFYHOST,
+            2L
+        );
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_FAILONERROR,
+            1L
+        );
+
+        /*
+         * The speed tests showed four connections are stable,
+         * while attempts beyond that hit the Switch-side limit.
+         * Force one independent TCP connection per segment.
+         */
+
+        curl_easy_setopt(
+            easy[i],
+            CURLOPT_USERAGENT,
+            g_user_agent[0]
+                ? g_user_agent
+                : "SwitchDebridDownloader"
+        );
+
+        CURLMcode add_rc =
+            curl_multi_add_handle(
+                multi,
+                easy[i]
+            );
+
+        if (add_rc != CURLM_OK) {
+            setup_ok = false;
+            break;
+        }
+    }
+
+    CURLMcode mrc =
+        CURLM_OK;
+
+    if (setup_ok) {
+        int running = 0;
+
+        mrc =
+            curl_multi_perform(
+                multi,
+                &running
+            );
+
+        while (
+            mrc == CURLM_OK &&
+            running > 0
+        ) {
+            int numfds = 0;
+
+            mrc =
+                curl_multi_wait(
+                    multi,
+                    NULL,
+                    0,
+                    1000,
+                    &numfds
+                );
+
+            if (mrc != CURLM_OK)
+                break;
+
+            mrc =
+                curl_multi_perform(
+                    multi,
+                    &running
+                );
+        }
+    }
+
+    int messages_left = 0;
+    CURLMsg *message = NULL;
+
+    while (
+        (
+            message =
+                curl_multi_info_read(
+                    multi,
+                    &messages_left
+                )
+        ) != NULL
+    ) {
+        if (
+            message->msg !=
+            CURLMSG_DONE
+        ) {
+            continue;
+        }
+
+        for (
+            int i = 0;
+            i < DOWNLOAD_SEGMENTS;
+            i++
+        ) {
+            if (
+                easy[i] ==
+                message->easy_handle
+            ) {
+                results[i] =
+                    message->data.result;
+
+                break;
+            }
+        }
+    }
+
+    bool success =
+        setup_ok &&
+        mrc == CURLM_OK;
+
+    for (
+        int i = 0;
+        i < DOWNLOAD_SEGMENTS;
+        i++
+    ) {
+        if (easy[i]) {
+            curl_easy_getinfo(
+                easy[i],
+                CURLINFO_RESPONSE_CODE,
+                &http_status[i]
+            );
+        }
+
+        if (contexts[i].io_buffer) {
+            if (
+                success &&
+                (
+                    contexts[i].io_failed ||
+                    !buffered_file_flush(
+                        contexts[i].file,
+                        contexts[i].io_buffer,
+                        &contexts[i].io_used,
+                        &contexts[i].io_failed
+                    )
+                )
+            ) {
+                success = false;
+            }
+
+            free(
+                contexts[i].io_buffer
+            );
+
+            contexts[i].io_buffer = NULL;
+        }
+
+        if (files[i]) {
+            if (
+                fclose(
+                    files[i]
+                ) != 0
+            ) {
+                success = false;
+            }
+
+            files[i] = NULL;
+        }
+
+        if (easy[i]) {
+            curl_multi_remove_handle(
+                multi,
+                easy[i]
+            );
+
+            curl_easy_cleanup(
+                easy[i]
+            );
+
+            easy[i] = NULL;
+        }
+    }
+
+    curl_multi_cleanup(
+        multi
+    );
+
+    for (
+        int i = 0;
+        i < DOWNLOAD_SEGMENTS;
+        i++
+    ) {
+        struct stat st;
+
+        if (
+            results[i] != CURLE_OK ||
+            http_status[i] != 206 ||
+            stat(
+                segment_paths[i],
+                &st
+            ) != 0 ||
+            (unsigned long long)st.st_size !=
+                expected[i]
+        ) {
+            success = false;
+
+            if (!error[0]) {
+                snprintf(
+                    error,
+                    error_size,
+                    "Segment %d failed: curl=%d HTTP=%ld",
+                    i + 1,
+                    (int)results[i],
+                    http_status[i]
+                );
+            }
+        }
+    }
+
+    if (
+        success &&
+        !combine_segment_files(
+            segment_paths,
+            part_path,
+            error,
+            error_size
+        )
+    ) {
+        success = false;
+    }
+
+    remove_segment_files(
+        segment_paths
+    );
+
+    if (!success) {
+        remove(
+            part_path
+        );
+
+        if (!error[0]) {
+            snprintf(
+                error,
+                error_size,
+                "Segmented download failed"
+            );
+        }
+
+        return false;
+    }
+
+    if (
+        rename(
+            part_path,
+            final_path
+        ) != 0
+    ) {
+        remove(
+            part_path
+        );
+
+        snprintf(
+            error,
+            error_size,
+            "Could not finalize downloaded file"
+        );
+
+        return false;
+    }
+
+    if (
+        !archive_extract_if_needed(
+            final_path,
+            error,
+            error_size
+        )
+    ) {
+        return false;
+    }
+
+    return true;
+}
+
+
+static bool download_file(
+    int worker_index,
+    const UnlockResult *unlock,
+    char *error,
+    size_t error_size
+)
+{
+    char filename[1024];
+
+    snprintf(
+        filename,
+        sizeof(filename),
+        "%s",
+        unlock->filename[0]
+            ? unlock->filename
+            : "download.bin"
+    );
+
+    sanitize_filename(
+        filename
+    );
+
+    char final_path[2048];
+    char part_path[2080];
+
+    choose_output_path(
+        filename,
+        final_path,
+        sizeof(final_path),
+        part_path,
+        sizeof(part_path)
+    );
+
+    /*
+     * The Switch tests showed four simultaneous HTTP/1.1
+     * connections are stable and materially faster than one.
+     * Try the four-range path first. If the host does not honor
+     * ranges, the file size is unavailable, or any segment fails,
+     * clean up and fall back to the proven single-stream path.
+     */
+    char segmented_error[512] = {0};
+
+    if (
+        download_file_segmented(
+            worker_index,
+            unlock,
+            part_path,
+            final_path,
+            segmented_error,
+            sizeof(segmented_error)
+        )
+    ) {
+        return true;
+    }
+
+    /* Reset progress before the fallback starts from byte zero. */
+    mutexLock(
+        &g_mutex
+    );
+
+    g_worker_progress[
+        worker_index
+    ].downloaded = 0;
+
+    g_worker_progress[
+        worker_index
+    ].total =
+        unlock->filesize;
+
+    g_worker_progress[
+        worker_index
+    ].bytes_per_second = 0;
+
+    g_worker_progress[
+        worker_index
+    ].last_downloaded = 0;
+
+    g_worker_progress[
+        worker_index
+    ].last_time.tv_sec = 0;
+
+    g_worker_progress[
+        worker_index
+    ].last_time.tv_nsec = 0;
+
+    mutexUnlock(
+        &g_mutex
+    );
+
+    bool ok =
+        download_file_single(
+            worker_index,
+            unlock,
+            part_path,
+            final_path,
+            error,
+            error_size
+        );
+
+    if (
+        !ok &&
+        segmented_error[0] &&
+        error[0]
+    ) {
+        char single_error[512];
+
+        snprintf(
+            single_error,
+            sizeof(single_error),
+            "%s",
+            error
+        );
+
+        snprintf(
+            error,
+            error_size,
+            "4-way: %.180s; fallback: %.180s",
+            segmented_error,
+            single_error
+        );
+    }
+
+    return ok;
+}
+
+
+/* ========================================================= */
+/* Queue                                                     */
+/* ========================================================= */
+
+static char *pop_job(void)
+{
+    mutexLock(
+        &g_mutex
+    );
+
+    if (
+        g_queue.count <= 0
+    ) {
+        mutexUnlock(
+            &g_mutex
+        );
+
+        return NULL;
+    }
+
+    char *job =
+        g_queue.items[
+            g_queue.head
+        ];
+
+    g_queue.items[
+        g_queue.head
+    ] = NULL;
+
+    g_queue.head =
+        (
+            g_queue.head +
+            1
+        ) %
+        MAX_QUEUE;
+
+    g_queue.count--;
+
+    mutexUnlock(
+        &g_mutex
+    );
+
+    return job;
+}
+
+
+void downloader_set_token(
+    const char *token
+)
+{
+    mutexLock(
+        &g_mutex
+    );
+
+    snprintf(
+        g_token,
+        sizeof(g_token),
+        "%s",
+        token ? token : ""
+    );
+
+    mutexUnlock(
+        &g_mutex
+    );
+}
+
+
+static bool downloader_enqueue_mode(
+    const char *url,
+    char mode
+)
+{
+    if (
+        !url ||
+        !url[0]
+    ) {
+        return false;
+    }
+
+    size_t len =
+        strlen(url);
+
+    char *copy =
+        malloc(
+            len + 3
+        );
+
+    if (!copy)
+        return false;
+
+    copy[0] = mode;
+    copy[1] = '\t';
+
+    memcpy(
+        copy + 2,
+        url,
+        len + 1
+    );
+
+    mutexLock(
+        &g_mutex
+    );
+
+    if (
+        g_queue.count >=
+        MAX_QUEUE
+    ) {
+        mutexUnlock(
+            &g_mutex
+        );
+
+        free(copy);
+
+        return false;
+    }
+
+    g_queue.items[
+        g_queue.tail
+    ] = copy;
+
+    g_queue.tail =
+        (
+            g_queue.tail +
+            1
+        ) %
+        MAX_QUEUE;
+
+    g_queue.count++;
+
+    mutexUnlock(
+        &g_mutex
+    );
+
+    return true;
+}
+
+
+bool downloader_enqueue_direct(
+    const char *url
+)
+{
+    return
+        downloader_enqueue_mode(
+            url,
+            'D'
+        );
+}
+
+
+bool downloader_enqueue_alldebrid(
+    const char *url
+)
+{
+    return
+        downloader_enqueue_mode(
+            url,
+            'A'
+        );
+}
+
+
+bool downloader_enqueue(
+    const char *url
+)
+{
+    return
+        downloader_enqueue_alldebrid(
+            url
+        );
+}
+
+
+/* ========================================================= */
+/* Worker                                                    */
+/* ========================================================= */
+
+static void worker_thread(
+    void *arg
+)
+{
+    int worker_index =
+        (int)(intptr_t)arg;
+
+    while (g_running) {
+        char *job =
+            pop_job();
+
+        if (!job) {
+            svcSleepThread(
+                200LL *
+                1000LL *
+                1000LL
+            );
+
+            continue;
+        }
+
+        bool through_alldebrid =
+            job[0] == 'A' &&
+            job[1] == '\t';
+
+        bool direct =
+            job[0] == 'D' &&
+            job[1] == '\t';
+
+        char *source_url =
+            (
+                through_alldebrid ||
+                direct
+            )
+                ? job + 2
+                : job;
+
+        mutexLock(
+            &g_mutex
+        );
+
+        g_worker_progress[
+            worker_index
+        ].active = true;
+
+        g_worker_progress[
+            worker_index
+        ].downloaded = 0;
+
+        g_worker_progress[
+            worker_index
+        ].total = 0;
+
+        snprintf(
+            g_worker_progress[worker_index].filename,
+            sizeof(g_worker_progress[worker_index].filename),
+            "%s",
+            through_alldebrid
+                ? "Unlocking through AllDebrid..."
+                : "Preparing direct URL..."
+        );
+
+        mutexUnlock(
+            &g_mutex
+        );
+
+        UnlockResult unlock;
+
+        bool success =
+            through_alldebrid
+                ? unlock_link(
+                    source_url,
+                    &unlock
+                )
+                : prepare_direct_link(
+                    worker_index,
+                    source_url,
+                    &unlock
+                );
+
+        char error[512] = {0};
+
+        if (success) {
+            mutexLock(
+                &g_mutex
+            );
+
+            snprintf(
+                g_worker_progress[worker_index].filename,
+                sizeof(g_worker_progress[worker_index].filename),
+                "%s",
+                unlock.filename[0]
+                    ? unlock.filename
+                    : "download.bin"
+            );
+
+            mutexUnlock(
+                &g_mutex
+            );
+
+            success =
+                download_file(
+                    worker_index,
+                    &unlock,
+                    error,
+                    sizeof(error)
+                );
+        }
+        else {
+            snprintf(
+                error,
+                sizeof(error),
+                "%s",
+                unlock.error[0]
+                    ? unlock.error
+                    : (
+                        through_alldebrid
+                            ? "Unlock failed"
+                            : "Direct URL preparation failed"
+                    )
+            );
+        }
+
+        mutexLock(
+            &g_mutex
+        );
+
+        g_worker_progress[
+            worker_index
+        ].active = false;
+
+        g_worker_progress[
+            worker_index
+        ].downloaded = 0;
+
+        g_worker_progress[
+            worker_index
+        ].total = 0;
+
+        g_worker_progress[
+            worker_index
+        ].filename[0] = '\0';
+
+        if (success)
+            g_completed++;
+        else
+            g_failed++;
+
+        mutexUnlock(
+            &g_mutex
+        );
+
+        if (success) {
+            append_log(
+                COMPLETED_LOG,
+                source_url,
+                unlock.filename
+            );
+        }
+        else {
+            append_log(
+                FAILED_LOG,
+                source_url,
+                error
+            );
+        }
+
+        free(
+            job
+        );
+    }
+}
+
+
+
+/* ========================================================= */
+/* Speed diagnostics                                         */
+/* ========================================================= */
+
+typedef struct {
+    unsigned long long bytes;
+    unsigned long long limit;
+} NetworkDiagContext;
+
+
+static size_t network_diag_write(
+    char *ptr,
+    size_t size,
+    size_t nmemb,
+    void *userdata
+)
+{
+    (void)ptr;
+
+    NetworkDiagContext *ctx =
+        (NetworkDiagContext *)userdata;
+
+    size_t amount =
+        size * nmemb;
+
+    ctx->bytes +=
+        (unsigned long long)amount;
+
+    return amount;
+}
+
+
+static int network_diag_progress(
+    void *userdata,
+    curl_off_t dltotal,
+    curl_off_t dlnow,
+    curl_off_t ultotal,
+    curl_off_t ulnow
+)
+{
+    (void)dltotal;
+    (void)ultotal;
+    (void)ulnow;
+
+    NetworkDiagContext *ctx =
+        (NetworkDiagContext *)userdata;
+
+    if (
+        dlnow >= 0 &&
+        (unsigned long long)dlnow >=
+            ctx->limit
+    ) {
+        return 1;
+    }
+
+    return 0;
+}
+
+
+static double elapsed_seconds(
+    const struct timespec *start,
+    const struct timespec *end
+)
+{
+    return
+        (double)(
+            end->tv_sec -
+            start->tv_sec
+        ) +
+        (double)(
+            end->tv_nsec -
+            start->tv_nsec
+        ) /
+        1000000000.0;
+}
+
+
+
+
+typedef struct {
+    CURL *easy;
+    NetworkDiagContext progress;
+    char url[256];
+} RawParallelTest;
+
+
+bool downloader_debug_raw_parallel_8(
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+)
+{
+    if (mb_per_second)
+        *mb_per_second = 0.0;
+
+    if (bytes_tested)
+        *bytes_tested = 0;
+
+    enum {
+        CONNECTIONS = 8
+    };
+
+    const unsigned long long per_connection =
+        4ULL *
+        1024ULL *
+        1024ULL;
+
+    RawParallelTest tests[CONNECTIONS];
+    CURLcode results[CONNECTIONS];
+
+    memset(
+        tests,
+        0,
+        sizeof(tests)
+    );
+
+    for (
+        int i = 0;
+        i < CONNECTIONS;
+        i++
+    ) {
+        results[i] = CURLE_OK;
+    }
+
+    CURLM *multi =
+        curl_multi_init();
+
+    if (!multi) {
+        snprintf(
+            error,
+            error_size,
+            "curl_multi_init failed."
+        );
+
+        return false;
+    }
+
+    bool setup_ok = true;
+
+    for (
+        int i = 0;
+        i < CONNECTIONS;
+        i++
+    ) {
+        /*
+         * Separate query parameter prevents the test
+         * connections from looking identical to caches.
+         */
+        snprintf(
+            tests[i].url,
+            sizeof(tests[i].url),
+            "https://speed.cloudflare.com/"
+            "__down?bytes=4194304&id=%d",
+            i
+        );
+
+        tests[i].easy =
+            curl_easy_init();
+
+        if (!tests[i].easy) {
+            setup_ok = false;
+            break;
+        }
+
+        tests[i].progress.bytes = 0;
+        tests[i].progress.limit =
+            per_connection;
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_URL,
+            tests[i].url
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_WRITEFUNCTION,
+            network_diag_write
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_WRITEDATA,
+            &tests[i].progress
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_FOLLOWLOCATION,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_MAXREDIRS,
+            5L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_CONNECTTIMEOUT,
+            20L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_TIMEOUT,
+            90L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_NOSIGNAL,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_SSL_VERIFYPEER,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_SSL_VERIFYHOST,
+            2L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_HTTP_VERSION,
+            CURL_HTTP_VERSION_1_1
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_FRESH_CONNECT,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_FORBID_REUSE,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_USERAGENT,
+            "SwitchDebridDownloader"
+        );
+
+        if (
+            curl_multi_add_handle(
+                multi,
+                tests[i].easy
+            ) != CURLM_OK
+        ) {
+            setup_ok = false;
+            break;
+        }
+    }
+
+    if (!setup_ok) {
+        for (
+            int i = 0;
+            i < CONNECTIONS;
+            i++
+        ) {
+            if (tests[i].easy) {
+                curl_multi_remove_handle(
+                    multi,
+                    tests[i].easy
+                );
+
+                curl_easy_cleanup(
+                    tests[i].easy
+                );
+            }
+        }
+
+        curl_multi_cleanup(multi);
+
+        snprintf(
+            error,
+            error_size,
+            "Could not prepare raw 8-way test."
+        );
+
+        return false;
+    }
+
+    struct timespec start;
+    struct timespec end;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &start
+    );
+
+    int running = 0;
+
+    CURLMcode mrc =
+        curl_multi_perform(
+            multi,
+            &running
+        );
+
+    while (
+        mrc == CURLM_OK &&
+        running > 0
+    ) {
+        int numfds = 0;
+
+        mrc =
+            curl_multi_wait(
+                multi,
+                NULL,
+                0,
+                1000,
+                &numfds
+            );
+
+        if (mrc != CURLM_OK)
+            break;
+
+        mrc =
+            curl_multi_perform(
+                multi,
+                &running
+            );
+    }
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &end
+    );
+
+    int messages_left = 0;
+    CURLMsg *msg = NULL;
+
+    while (
+        (
+            msg =
+                curl_multi_info_read(
+                    multi,
+                    &messages_left
+                )
+        ) != NULL
+    ) {
+        if (
+            msg->msg !=
+            CURLMSG_DONE
+        ) {
+            continue;
+        }
+
+        for (
+            int i = 0;
+            i < CONNECTIONS;
+            i++
+        ) {
+            if (
+                tests[i].easy ==
+                msg->easy_handle
+            ) {
+                results[i] =
+                    msg->data.result;
+
+                break;
+            }
+        }
+    }
+
+    bool success =
+        mrc == CURLM_OK;
+
+    unsigned long long total_bytes = 0;
+
+    for (
+        int i = 0;
+        i < CONNECTIONS;
+        i++
+    ) {
+        long http_status = 0;
+        long os_errno = 0;
+
+        curl_easy_getinfo(
+            tests[i].easy,
+            CURLINFO_RESPONSE_CODE,
+            &http_status
+        );
+
+        curl_easy_getinfo(
+            tests[i].easy,
+            CURLINFO_OS_ERRNO,
+            &os_errno
+        );
+
+        total_bytes +=
+            tests[i].progress.bytes;
+
+        if (
+            results[i] != CURLE_OK ||
+            http_status != 200
+        ) {
+            if (success) {
+                snprintf(
+                    error,
+                    error_size,
+
+                    "Connection %d failed: "
+                    "curl=%d (%s), "
+                    "HTTP=%ld, errno=%ld",
+
+                    i + 1,
+                    (int)results[i],
+                    curl_easy_strerror(
+                        results[i]
+                    ),
+                    http_status,
+                    os_errno
+                );
+            }
+
+            success = false;
+        }
+    }
+
+    for (
+        int i = 0;
+        i < CONNECTIONS;
+        i++
+    ) {
+        curl_multi_remove_handle(
+            multi,
+            tests[i].easy
+        );
+
+        curl_easy_cleanup(
+            tests[i].easy
+        );
+    }
+
+    curl_multi_cleanup(
+        multi
+    );
+
+    if (!success)
+        return false;
+
+    double seconds =
+        elapsed_seconds(
+            &start,
+            &end
+        );
+
+    if (seconds <= 0.0) {
+        snprintf(
+            error,
+            error_size,
+            "Invalid timing result."
+        );
+
+        return false;
+    }
+
+    if (bytes_tested)
+        *bytes_tested =
+            total_bytes;
+
+    if (mb_per_second) {
+        *mb_per_second =
+            (
+                (double)total_bytes /
+                1048576.0
+            ) /
+            seconds;
+    }
+
+    return true;
+}
+
+
+bool downloader_debug_raw_network(
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+)
+{
+    if (mb_per_second)
+        *mb_per_second = 0.0;
+
+    if (bytes_tested)
+        *bytes_tested = 0;
+
+    DownloaderStats stats;
+
+    downloader_get_stats(
+        &stats
+    );
+
+    if (
+        stats.active > 0 ||
+        stats.queued > 0
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Wait for normal downloads to finish first."
+        );
+
+        return false;
+    }
+
+    CURL *curl =
+        curl_easy_init();
+
+    if (!curl) {
+        snprintf(
+            error,
+            error_size,
+            "curl_easy_init failed."
+        );
+
+        return false;
+    }
+
+    NetworkDiagContext ctx = {
+        .bytes = 0,
+        .limit =
+            8ULL *
+            1024ULL *
+            1024ULL
+    };
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_URL,
+        "https://speed.cloudflare.com/__down?bytes=8388608"
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FOLLOWLOCATION,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_MAXREDIRS,
+        10L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEFUNCTION,
+        network_diag_write
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEDATA,
+        &ctx
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_CONNECTTIMEOUT,
+        20L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_TIMEOUT,
+        60L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOSIGNAL,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYPEER,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYHOST,
+        2L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_USERAGENT,
+        "SwitchDebridDownloader"
+    );
+
+    struct timespec start;
+    struct timespec end;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &start
+    );
+
+    CURLcode rc =
+        curl_easy_perform(
+            curl
+        );
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &end
+    );
+
+    long http_status = 0;
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_RESPONSE_CODE,
+        &http_status
+    );
+
+    curl_easy_cleanup(
+        curl
+    );
+
+    if (
+        rc != CURLE_OK ||
+        http_status != 200
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Raw network test failed: curl=%d HTTP=%ld",
+            (int)rc,
+            http_status
+        );
+
+        return false;
+    }
+
+    double seconds =
+        elapsed_seconds(
+            &start,
+            &end
+        );
+
+    if (seconds <= 0.0) {
+        snprintf(
+            error,
+            error_size,
+            "Invalid timing result."
+        );
+
+        return false;
+    }
+
+    if (bytes_tested)
+        *bytes_tested =
+            ctx.bytes;
+
+    if (mb_per_second) {
+        *mb_per_second =
+            (
+                (double)ctx.bytes /
+                1048576.0
+            ) /
+            seconds;
+    }
+
+    return true;
+}
+
+
+
+/* --------------------------------------------------------- */
+/* HTTP benchmark variants                                   */
+/* --------------------------------------------------------- */
+
+static bool direct_speed_test(
+    const char *direct_url,
+    const char *user_agent,
+    long requested_http_version,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    long *http_version_used,
+    char *error,
+    size_t error_size
+)
+{
+    if (mb_per_second)
+        *mb_per_second = 0.0;
+
+    if (bytes_tested)
+        *bytes_tested = 0;
+
+    if (http_version_used)
+        *http_version_used = 0;
+
+    CURL *curl =
+        curl_easy_init();
+
+    if (!curl) {
+        snprintf(
+            error,
+            error_size,
+            "curl_easy_init failed."
+        );
+
+        return false;
+    }
+
+    NetworkDiagContext ctx = {
+        .bytes = 0,
+        .limit =
+            8ULL *
+            1024ULL *
+            1024ULL
+    };
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_URL,
+        direct_url
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FOLLOWLOCATION,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_MAXREDIRS,
+        10L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_RANGE,
+        "0-8388607"
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEFUNCTION,
+        network_diag_write
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEDATA,
+        &ctx
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_XFERINFOFUNCTION,
+        network_diag_progress
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_XFERINFODATA,
+        &ctx
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOPROGRESS,
+        0L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_CONNECTTIMEOUT,
+        30L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_TIMEOUT,
+        60L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOSIGNAL,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYPEER,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYHOST,
+        2L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_HTTP_VERSION,
+        requested_http_version
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_USERAGENT,
+        user_agent
+            ? user_agent
+            : "SwitchDebridDownloader"
+    );
+
+    struct timespec start;
+    struct timespec end;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &start
+    );
+
+    CURLcode rc =
+        curl_easy_perform(
+            curl
+        );
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &end
+    );
+
+    long http_status = 0;
+    long actual_http_version = 0;
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_RESPONSE_CODE,
+        &http_status
+    );
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_HTTP_VERSION,
+        &actual_http_version
+    );
+
+    curl_easy_cleanup(
+        curl
+    );
+
+    bool intentionally_stopped =
+        (
+            rc ==
+            CURLE_ABORTED_BY_CALLBACK
+        ) &&
+        (
+            ctx.bytes >=
+            ctx.limit
+        );
+
+    if (
+        rc != CURLE_OK &&
+        !intentionally_stopped
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "curl=%d HTTP=%ld",
+            (int)rc,
+            http_status
+        );
+
+        return false;
+    }
+
+    if (
+        http_status != 200 &&
+        http_status != 206
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "HTTP %ld",
+            http_status
+        );
+
+        return false;
+    }
+
+    double seconds =
+        elapsed_seconds(
+            &start,
+            &end
+        );
+
+    if (seconds <= 0.0) {
+        snprintf(
+            error,
+            error_size,
+            "Invalid timing result."
+        );
+
+        return false;
+    }
+
+    if (bytes_tested)
+        *bytes_tested =
+            ctx.bytes;
+
+    if (http_version_used)
+        *http_version_used =
+            actual_http_version;
+
+    if (mb_per_second) {
+        *mb_per_second =
+            (
+                (double)ctx.bytes /
+                1048576.0
+            ) /
+            seconds;
+    }
+
+    return true;
+}
+
+
+
+bool downloader_debug_full_get(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+)
+{
+    if (mb_per_second)
+        *mb_per_second = 0.0;
+
+    if (bytes_tested)
+        *bytes_tested = 0;
+
+    UnlockResult unlock;
+
+    if (
+        !unlock_link(
+            source_url,
+            &unlock
+        )
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Unlock failed: %s",
+            unlock.error
+        );
+
+        return false;
+    }
+
+    CURL *curl =
+        curl_easy_init();
+
+    if (!curl) {
+        snprintf(
+            error,
+            error_size,
+            "curl_easy_init failed."
+        );
+
+        return false;
+    }
+
+    NetworkDiagContext ctx = {
+        .bytes = 0,
+        .limit =
+            32ULL *
+            1024ULL *
+            1024ULL
+    };
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_URL,
+        unlock.direct_url
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FOLLOWLOCATION,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_MAXREDIRS,
+        10L
+    );
+
+    /*
+     * IMPORTANT:
+     * No CURLOPT_RANGE here.
+     * This is deliberately a normal full GET.
+     */
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEFUNCTION,
+        network_diag_write
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEDATA,
+        &ctx
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_XFERINFOFUNCTION,
+        network_diag_progress
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_XFERINFODATA,
+        &ctx
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOPROGRESS,
+        0L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_CONNECTTIMEOUT,
+        30L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_TIMEOUT,
+        60L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOSIGNAL,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYPEER,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYHOST,
+        2L
+    );
+
+
+    /*
+     * libcurl normally receives in much smaller chunks.
+     * A larger buffer reduces receive/read overhead.
+     */
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_USERAGENT,
+        g_user_agent[0]
+            ? g_user_agent
+            : "SwitchDebridDownloader"
+    );
+
+    struct timespec start;
+    struct timespec end;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &start
+    );
+
+    CURLcode rc =
+        curl_easy_perform(
+            curl
+        );
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &end
+    );
+
+    long http_status = 0;
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_RESPONSE_CODE,
+        &http_status
+    );
+
+    curl_easy_cleanup(
+        curl
+    );
+
+    bool intentionally_stopped =
+        (
+            rc ==
+            CURLE_ABORTED_BY_CALLBACK
+        ) &&
+        (
+            ctx.bytes >=
+            ctx.limit
+        );
+
+    if (
+        rc != CURLE_OK &&
+        !intentionally_stopped
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "curl=%d HTTP=%ld",
+            (int)rc,
+            http_status
+        );
+
+        return false;
+    }
+
+    if (http_status != 200) {
+        snprintf(
+            error,
+            error_size,
+            "Expected HTTP 200, got %ld",
+            http_status
+        );
+
+        return false;
+    }
+
+    double seconds =
+        elapsed_seconds(
+            &start,
+            &end
+        );
+
+    if (seconds <= 0.0) {
+        snprintf(
+            error,
+            error_size,
+            "Invalid timing result."
+        );
+
+        return false;
+    }
+
+    if (bytes_tested)
+        *bytes_tested =
+            ctx.bytes;
+
+    if (mb_per_second) {
+        *mb_per_second =
+            (
+                (double)ctx.bytes /
+                1048576.0
+            ) /
+            seconds;
+    }
+
+    return true;
+}
+
+
+bool downloader_debug_edge_ua(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+)
+{
+    UnlockResult unlock;
+
+    if (
+        !unlock_link(
+            source_url,
+            &unlock
+        )
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Unlock failed: %s",
+            unlock.error
+        );
+
+        return false;
+    }
+
+    return direct_speed_test(
+        unlock.direct_url,
+
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/154.0.0.0 "
+        "Safari/537.36 "
+        "Edg/154.0.0.0",
+
+        CURL_HTTP_VERSION_1_1,
+
+        mb_per_second,
+        bytes_tested,
+        NULL,
+        error,
+        error_size
+    );
+}
+
+
+bool downloader_debug_http2(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    long *http_version_used,
+    char *error,
+    size_t error_size
+)
+{
+    const curl_version_info_data *info =
+        curl_version_info(
+            CURLVERSION_NOW
+        );
+
+    if (
+        !info ||
+        !(info->features & CURL_VERSION_HTTP2)
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "This Switch libcurl build has no HTTP/2 support."
+        );
+
+        return false;
+    }
+
+    UnlockResult unlock;
+
+    if (
+        !unlock_link(
+            source_url,
+            &unlock
+        )
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Unlock failed: %s",
+            unlock.error
+        );
+
+        return false;
+    }
+
+    return direct_speed_test(
+        unlock.direct_url,
+
+        g_user_agent[0]
+            ? g_user_agent
+            : "SwitchDebridDownloader",
+
+        CURL_HTTP_VERSION_2TLS,
+
+        mb_per_second,
+        bytes_tested,
+        http_version_used,
+        error,
+        error_size
+    );
+}
+
+
+typedef struct {
+    CURL *easy;
+    NetworkDiagContext progress;
+    char range[64];
+} SegmentTest;
+
+
+bool downloader_debug_segmented(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+)
+{
+    if (mb_per_second)
+        *mb_per_second = 0.0;
+
+    if (bytes_tested)
+        *bytes_tested = 0;
+
+    UnlockResult unlock;
+
+    if (
+        !unlock_link(
+            source_url,
+            &unlock
+        )
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Unlock failed: %s",
+            unlock.error
+        );
+
+        return false;
+    }
+
+    CURLM *multi =
+        curl_multi_init();
+
+    if (!multi) {
+        snprintf(
+            error,
+            error_size,
+            "curl_multi_init failed."
+        );
+
+        return false;
+    }
+
+    enum {
+        SEGMENTS = 4
+    };
+
+    const unsigned long long
+        segment_size =
+            2ULL *
+            1024ULL *
+            1024ULL;
+
+    SegmentTest tests[
+        SEGMENTS
+    ];
+
+    memset(
+        tests,
+        0,
+        sizeof(tests)
+    );
+
+    bool setup_ok = true;
+
+    for (
+        int i = 0;
+        i < SEGMENTS;
+        i++
+    ) {
+        tests[i].easy =
+            curl_easy_init();
+
+        if (!tests[i].easy) {
+            setup_ok = false;
+            break;
+        }
+
+        unsigned long long start =
+            (unsigned long long)i *
+            segment_size;
+
+        unsigned long long end =
+            start +
+            segment_size -
+            1;
+
+        snprintf(
+            tests[i].range,
+            sizeof(tests[i].range),
+            "%llu-%llu",
+            start,
+            end
+        );
+
+        tests[i].progress.bytes = 0;
+        tests[i].progress.limit =
+            segment_size;
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_URL,
+            unlock.direct_url
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_RANGE,
+            tests[i].range
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_FOLLOWLOCATION,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_MAXREDIRS,
+            10L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_WRITEFUNCTION,
+            network_diag_write
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_WRITEDATA,
+            &tests[i].progress
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_XFERINFOFUNCTION,
+            network_diag_progress
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_XFERINFODATA,
+            &tests[i].progress
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_NOPROGRESS,
+            0L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_CONNECTTIMEOUT,
+            30L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_TIMEOUT,
+            60L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_NOSIGNAL,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_SSL_VERIFYPEER,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_SSL_VERIFYHOST,
+            2L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_HTTP_VERSION,
+            CURL_HTTP_VERSION_1_1
+        );
+
+        /*
+         * Force these to be separate HTTP connections.
+         */
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_FRESH_CONNECT,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_USERAGENT,
+            g_user_agent[0]
+                ? g_user_agent
+                : "SwitchDebridDownloader"
+        );
+
+        CURLMcode mrc =
+            curl_multi_add_handle(
+                multi,
+                tests[i].easy
+            );
+
+        if (
+            mrc != CURLM_OK
+        ) {
+            setup_ok = false;
+            break;
+        }
+    }
+
+    if (!setup_ok) {
+        for (
+            int i = 0;
+            i < SEGMENTS;
+            i++
+        ) {
+            if (
+                tests[i].easy
+            ) {
+                curl_multi_remove_handle(
+                    multi,
+                    tests[i].easy
+                );
+
+                curl_easy_cleanup(
+                    tests[i].easy
+                );
+            }
+        }
+
+        curl_multi_cleanup(
+            multi
+        );
+
+        snprintf(
+            error,
+            error_size,
+            "Could not prepare segmented test."
+        );
+
+        return false;
+    }
+
+    struct timespec start_time;
+    struct timespec end_time;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &start_time
+    );
+
+    int running = 0;
+
+    CURLMcode mrc =
+        curl_multi_perform(
+            multi,
+            &running
+        );
+
+    while (
+        mrc == CURLM_OK &&
+        running > 0
+    ) {
+        int numfds = 0;
+
+        mrc =
+            curl_multi_wait(
+                multi,
+                NULL,
+                0,
+                1000,
+                &numfds
+            );
+
+        if (
+            mrc != CURLM_OK
+        ) {
+            break;
+        }
+
+        mrc =
+            curl_multi_perform(
+                multi,
+                &running
+            );
+    }
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &end_time
+    );
+
+    bool success =
+        mrc == CURLM_OK;
+
+    unsigned long long
+        total_bytes = 0;
+
+    for (
+        int i = 0;
+        i < SEGMENTS;
+        i++
+    ) {
+        long http_status = 0;
+
+        curl_easy_getinfo(
+            tests[i].easy,
+            CURLINFO_RESPONSE_CODE,
+            &http_status
+        );
+
+        total_bytes +=
+            tests[i].progress.bytes;
+
+        /*
+         * A segmented transfer is only valid when
+         * the server actually honors Range.
+         */
+        if (
+            http_status != 206
+        ) {
+            success = false;
+
+            snprintf(
+                error,
+                error_size,
+                "Server did not honor byte ranges "
+                "(segment %d returned HTTP %ld).",
+                i + 1,
+                http_status
+            );
+        }
+    }
+
+    for (
+        int i = 0;
+        i < SEGMENTS;
+        i++
+    ) {
+        curl_multi_remove_handle(
+            multi,
+            tests[i].easy
+        );
+
+        curl_easy_cleanup(
+            tests[i].easy
+        );
+    }
+
+    curl_multi_cleanup(
+        multi
+    );
+
+    if (!success) {
+        if (!error[0]) {
+            snprintf(
+                error,
+                error_size,
+                "Segmented curl test failed."
+            );
+        }
+
+        return false;
+    }
+
+    double seconds =
+        elapsed_seconds(
+            &start_time,
+            &end_time
+        );
+
+    if (seconds <= 0.0) {
+        snprintf(
+            error,
+            error_size,
+            "Invalid timing result."
+        );
+
+        return false;
+    }
+
+    if (bytes_tested)
+        *bytes_tested =
+            total_bytes;
+
+    if (mb_per_second) {
+        *mb_per_second =
+            (
+                (double)total_bytes /
+                1048576.0
+            ) /
+            seconds;
+    }
+
+    return true;
+}
+
+
+
+static void direct_url_host(
+    const char *url,
+    char *host,
+    size_t host_size
+)
+{
+    if (
+        !url ||
+        !host ||
+        host_size == 0
+    ) {
+        return;
+    }
+
+    host[0] = '\0';
+
+    const char *start =
+        strstr(
+            url,
+            "://"
+        );
+
+    if (start)
+        start += 3;
+    else
+        start = url;
+
+    const char *end =
+        start;
+
+    while (
+        *end &&
+        *end != '/' &&
+        *end != '?' &&
+        *end != '#' &&
+        *end != ':'
+    ) {
+        end++;
+    }
+
+    size_t len =
+        (size_t)(
+            end -
+            start
+        );
+
+    if (
+        len >=
+        host_size
+    ) {
+        len =
+            host_size - 1;
+    }
+
+    memcpy(
+        host,
+        start,
+        len
+    );
+
+    host[len] = '\0';
+}
+
+
+bool downloader_unlock_direct_url(
+    const char *source_url,
+    char *direct_url,
+    size_t direct_url_size,
+    char *error,
+    size_t error_size
+)
+{
+    if (
+        !direct_url ||
+        direct_url_size == 0
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Invalid output buffer."
+        );
+
+        return false;
+    }
+
+    direct_url[0] = '\0';
+
+    UnlockResult unlock;
+
+    if (
+        !unlock_link(
+            source_url,
+            &unlock
+        )
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Unlock failed: %s",
+            unlock.error[0]
+                ? unlock.error
+                : "unknown error"
+        );
+
+        return false;
+    }
+
+    /*
+     * Do not allow a URL to inject extra HTTP headers.
+     */
+    if (
+        strchr(
+            unlock.direct_url,
+            '\r'
+        ) ||
+        strchr(
+            unlock.direct_url,
+            '\n'
+        )
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Invalid direct URL."
+        );
+
+        return false;
+    }
+
+    if (
+        strlen(
+            unlock.direct_url
+        ) >=
+        direct_url_size
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Direct URL is too long."
+        );
+
+        return false;
+    }
+
+    snprintf(
+        direct_url,
+        direct_url_size,
+        "%s",
+        unlock.direct_url
+    );
+
+    return true;
+}
+
+
+bool downloader_debug_direct_metadata(
+    const char *source_url,
+    DownloaderConnectionInfo *info,
+    char *error,
+    size_t error_size
+)
+{
+    if (!info) {
+        snprintf(
+            error,
+            error_size,
+            "Invalid info pointer."
+        );
+
+        return false;
+    }
+
+    memset(
+        info,
+        0,
+        sizeof(*info)
+    );
+
+    UnlockResult unlock;
+
+    if (
+        !unlock_link(
+            source_url,
+            &unlock
+        )
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Unlock failed: %s",
+            unlock.error[0]
+                ? unlock.error
+                : "unknown error"
+        );
+
+        return false;
+    }
+
+    direct_url_host(
+        unlock.direct_url,
+        info->host,
+        sizeof(info->host)
+    );
+
+    CURL *curl =
+        curl_easy_init();
+
+    if (!curl) {
+        snprintf(
+            error,
+            error_size,
+            "curl_easy_init failed."
+        );
+
+        return false;
+    }
+
+    NetworkDiagContext ctx = {
+        .bytes = 0,
+        .limit =
+            64ULL *
+            1024ULL
+    };
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_URL,
+        unlock.direct_url
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FOLLOWLOCATION,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_MAXREDIRS,
+        10L
+    );
+
+    /*
+     * Only enough data to establish the connection
+     * and measure startup timings.
+     */
+    curl_easy_setopt(
+        curl,
+        CURLOPT_RANGE,
+        "0-65535"
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEFUNCTION,
+        network_diag_write
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEDATA,
+        &ctx
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_XFERINFOFUNCTION,
+        network_diag_progress
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_XFERINFODATA,
+        &ctx
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOPROGRESS,
+        0L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_CONNECTTIMEOUT,
+        30L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_TIMEOUT,
+        30L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOSIGNAL,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYPEER,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYHOST,
+        2L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_USERAGENT,
+        g_user_agent[0]
+            ? g_user_agent
+            : "SwitchDebridDownloader"
+    );
+
+    CURLcode rc =
+        curl_easy_perform(
+            curl
+        );
+
+    const char *primary_ip =
+        NULL;
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_PRIMARY_IP,
+        &primary_ip
+    );
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_RESPONSE_CODE,
+        &info->http_status
+    );
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_HTTP_VERSION,
+        &info->http_version
+    );
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_NAMELOOKUP_TIME,
+        &info->dns_seconds
+    );
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_CONNECT_TIME,
+        &info->tcp_seconds
+    );
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_APPCONNECT_TIME,
+        &info->tls_seconds
+    );
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_STARTTRANSFER_TIME,
+        &info->ttfb_seconds
+    );
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_TOTAL_TIME,
+        &info->total_seconds
+    );
+
+    if (primary_ip) {
+        snprintf(
+            info->primary_ip,
+            sizeof(info->primary_ip),
+            "%s",
+            primary_ip
+        );
+    }
+
+    curl_easy_cleanup(
+        curl
+    );
+
+    bool intentional_abort =
+        (
+            rc ==
+            CURLE_ABORTED_BY_CALLBACK
+        ) &&
+        (
+            ctx.bytes >=
+            ctx.limit
+        );
+
+    if (
+        rc != CURLE_OK &&
+        !intentional_abort
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "curl=%d",
+            (int)rc
+        );
+
+        return false;
+    }
+
+    return true;
+}
+
+
+
+static bool segmented_large_test(
+    const char *source_url,
+    int segment_count,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+)
+{
+    if (mb_per_second)
+        *mb_per_second = 0.0;
+
+    if (bytes_tested)
+        *bytes_tested = 0;
+
+    if (
+        segment_count != 8 &&
+        segment_count != 16
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Unsupported segment count."
+        );
+
+        return false;
+    }
+
+    DownloaderStats stats;
+
+    downloader_get_stats(
+        &stats
+    );
+
+    if (
+        stats.active > 0 ||
+        stats.queued > 0
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Wait for normal downloads to finish first."
+        );
+
+        return false;
+    }
+
+    UnlockResult unlock;
+
+    if (
+        !unlock_link(
+            source_url,
+            &unlock
+        )
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Unlock failed: %s",
+            unlock.error[0]
+                ? unlock.error
+                : "unknown error"
+        );
+
+        return false;
+    }
+
+    /*
+     * Total benchmark size = 128 MiB.
+     *
+     * 8 connections  = 16 MiB each
+     * 16 connections =  8 MiB each
+     */
+    const unsigned long long total_size =
+        32ULL *
+        1024ULL *
+        1024ULL;
+
+    const unsigned long long segment_size =
+        total_size /
+        (unsigned long long)segment_count;
+
+    SegmentTest *tests =
+        calloc(
+            (size_t)segment_count,
+            sizeof(*tests)
+        );
+
+    if (!tests) {
+        snprintf(
+            error,
+            error_size,
+            "Out of memory allocating segment table."
+        );
+
+        return false;
+    }
+
+    CURLM *multi =
+        curl_multi_init();
+
+    if (!multi) {
+        free(tests);
+
+        snprintf(
+            error,
+            error_size,
+            "curl_multi_init failed."
+        );
+
+        return false;
+    }
+
+    CURLcode results[16];
+
+    for (
+        int i = 0;
+        i < 16;
+        i++
+    ) {
+        results[i] =
+            CURLE_OK;
+    }
+
+    bool setup_ok = true;
+
+    for (
+        int i = 0;
+        i < segment_count;
+        i++
+    ) {
+        tests[i].easy =
+            curl_easy_init();
+
+        if (!tests[i].easy) {
+            setup_ok = false;
+            break;
+        }
+
+        unsigned long long range_start =
+            (unsigned long long)i *
+            segment_size;
+
+        unsigned long long range_end =
+            range_start +
+            segment_size -
+            1;
+
+        snprintf(
+            tests[i].range,
+            sizeof(tests[i].range),
+            "%llu-%llu",
+            range_start,
+            range_end
+        );
+
+        tests[i].progress.bytes = 0;
+        tests[i].progress.limit =
+            segment_size;
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_URL,
+            unlock.direct_url
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_RANGE,
+            tests[i].range
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_FOLLOWLOCATION,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_MAXREDIRS,
+            10L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_WRITEFUNCTION,
+            network_diag_write
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_WRITEDATA,
+            &tests[i].progress
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_CONNECTTIMEOUT,
+            30L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_TIMEOUT,
+            180L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_NOSIGNAL,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_SSL_VERIFYPEER,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_SSL_VERIFYHOST,
+            2L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_HTTP_VERSION,
+            CURL_HTTP_VERSION_1_1
+        );
+
+        /*
+         * We specifically want independent TCP connections.
+         */
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_FRESH_CONNECT,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_FORBID_REUSE,
+            1L
+        );
+
+        curl_easy_setopt(
+            tests[i].easy,
+            CURLOPT_USERAGENT,
+            g_user_agent[0]
+                ? g_user_agent
+                : "SwitchDebridDownloader"
+        );
+
+        CURLMcode mrc =
+            curl_multi_add_handle(
+                multi,
+                tests[i].easy
+            );
+
+        if (mrc != CURLM_OK) {
+            setup_ok = false;
+            break;
+        }
+    }
+
+    if (!setup_ok) {
+        for (
+            int i = 0;
+            i < segment_count;
+            i++
+        ) {
+            if (tests[i].easy) {
+                curl_multi_remove_handle(
+                    multi,
+                    tests[i].easy
+                );
+
+                curl_easy_cleanup(
+                    tests[i].easy
+                );
+            }
+        }
+
+        curl_multi_cleanup(
+            multi
+        );
+
+        free(tests);
+
+        snprintf(
+            error,
+            error_size,
+            "Could not prepare segmented test."
+        );
+
+        return false;
+    }
+
+    struct timespec start_time;
+    struct timespec end_time;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &start_time
+    );
+
+    int running = 0;
+
+    CURLMcode mrc =
+        curl_multi_perform(
+            multi,
+            &running
+        );
+
+    while (
+        mrc == CURLM_OK &&
+        running > 0
+    ) {
+        int numfds = 0;
+
+        mrc =
+            curl_multi_wait(
+                multi,
+                NULL,
+                0,
+                1000,
+                &numfds
+            );
+
+        if (mrc != CURLM_OK)
+            break;
+
+        mrc =
+            curl_multi_perform(
+                multi,
+                &running
+            );
+    }
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &end_time
+    );
+
+    /*
+     * Collect the actual CURLcode for every easy handle.
+     * HTTP response code alone is 0 when the request never
+     * reached the point of receiving an HTTP response.
+     */
+    int messages_left = 0;
+    CURLMsg *message = NULL;
+
+    while (
+        (
+            message =
+                curl_multi_info_read(
+                    multi,
+                    &messages_left
+                )
+        ) != NULL
+    ) {
+        if (
+            message->msg !=
+            CURLMSG_DONE
+        ) {
+            continue;
+        }
+
+        for (
+            int i = 0;
+            i < segment_count;
+            i++
+        ) {
+            if (
+                tests[i].easy ==
+                message->easy_handle
+            ) {
+                results[i] =
+                    message->data.result;
+
+                break;
+            }
+        }
+    }
+
+    bool success =
+        mrc == CURLM_OK;
+
+    unsigned long long total_bytes = 0;
+
+    for (
+        int i = 0;
+        i < segment_count;
+        i++
+    ) {
+        long http_status = 0;
+
+        curl_easy_getinfo(
+            tests[i].easy,
+            CURLINFO_RESPONSE_CODE,
+            &http_status
+        );
+
+        total_bytes +=
+            tests[i].progress.bytes;
+
+        /*
+         * The test only means anything when the host
+         * actually honours each byte range.
+         */
+        if (
+            results[i] != CURLE_OK ||
+            http_status != 206
+        ) {
+            success = false;
+
+            long os_errno = 0;
+
+            curl_easy_getinfo(
+                tests[i].easy,
+                CURLINFO_OS_ERRNO,
+                &os_errno
+            );
+
+            snprintf(
+                error,
+                error_size,
+
+                "Segment %d failed: "
+                "curl=%d (%s), "
+                "HTTP=%ld, "
+                "OS errno=%ld",
+
+                i + 1,
+                (int)results[i],
+                curl_easy_strerror(
+                    results[i]
+                ),
+                http_status,
+                os_errno
+            );
+
+            /*
+             * Keep the first failure; it is generally the
+             * most useful one.
+             */
+            break;
+        }
+    }
+
+    for (
+        int i = 0;
+        i < segment_count;
+        i++
+    ) {
+        if (tests[i].easy) {
+            curl_multi_remove_handle(
+                multi,
+                tests[i].easy
+            );
+
+            curl_easy_cleanup(
+                tests[i].easy
+            );
+        }
+    }
+
+    curl_multi_cleanup(
+        multi
+    );
+
+    free(tests);
+
+    if (!success) {
+        if (!error[0]) {
+            snprintf(
+                error,
+                error_size,
+                "Segmented curl test failed."
+            );
+        }
+
+        return false;
+    }
+
+    double seconds =
+        elapsed_seconds(
+            &start_time,
+            &end_time
+        );
+
+    if (seconds <= 0.0) {
+        snprintf(
+            error,
+            error_size,
+            "Invalid timing result."
+        );
+
+        return false;
+    }
+
+    if (bytes_tested)
+        *bytes_tested =
+            total_bytes;
+
+    if (mb_per_second) {
+        *mb_per_second =
+            (
+                (double)total_bytes /
+                1048576.0
+            ) /
+            seconds;
+    }
+
+    return true;
+}
+
+
+bool downloader_debug_segmented_8(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+)
+{
+    return segmented_large_test(
+        source_url,
+        8,
+        mb_per_second,
+        bytes_tested,
+        error,
+        error_size
+    );
+}
+
+
+bool downloader_debug_segmented_16(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+)
+{
+    return segmented_large_test(
+        source_url,
+        16,
+        mb_per_second,
+        bytes_tested,
+        error,
+        error_size
+    );
+}
+
+
+void downloader_get_curl_runtime_info(
+    char *version,
+    size_t version_size,
+    char *ssl,
+    size_t ssl_size,
+    bool *http2_supported
+)
+{
+    if (
+        version &&
+        version_size > 0
+    ) {
+        version[0] = '\0';
+    }
+
+    if (
+        ssl &&
+        ssl_size > 0
+    ) {
+        ssl[0] = '\0';
+    }
+
+    if (http2_supported)
+        *http2_supported = false;
+
+    const curl_version_info_data *info =
+        curl_version_info(
+            CURLVERSION_NOW
+        );
+
+    if (!info)
+        return;
+
+    if (
+        version &&
+        version_size > 0
+    ) {
+        snprintf(
+            version,
+            version_size,
+            "%s",
+            info->version
+                ? info->version
+                : "unknown"
+        );
+    }
+
+    if (
+        ssl &&
+        ssl_size > 0
+    ) {
+        snprintf(
+            ssl,
+            ssl_size,
+            "%s",
+            info->ssl_version
+                ? info->ssl_version
+                : "none/unknown"
+        );
+    }
+
+    if (http2_supported) {
+        *http2_supported =
+            (
+                info->features &
+                CURL_VERSION_HTTP2
+            ) != 0;
+    }
+}
+
+
+bool downloader_debug_network(
+    const char *source_url,
+    double *mb_per_second,
+    unsigned long long *bytes_tested,
+    char *error,
+    size_t error_size
+)
+{
+    if (mb_per_second)
+        *mb_per_second = 0.0;
+
+    if (bytes_tested)
+        *bytes_tested = 0;
+
+    DownloaderStats stats;
+
+    downloader_get_stats(
+        &stats
+    );
+
+    if (
+        stats.active > 0 ||
+        stats.queued > 0
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Stop/wait for normal downloads before running diagnostics."
+        );
+
+        return false;
+    }
+
+    if (!g_token[0]) {
+        snprintf(
+            error,
+            error_size,
+            "AllDebrid is not connected."
+        );
+
+        return false;
+    }
+
+    UnlockResult unlock;
+
+    if (
+        !unlock_link(
+            source_url,
+            &unlock
+        )
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Unlock failed: %s",
+            unlock.error[0]
+                ? unlock.error
+                : "unknown error"
+        );
+
+        return false;
+    }
+
+    CURL *curl =
+        curl_easy_init();
+
+    if (!curl) {
+        snprintf(
+            error,
+            error_size,
+            "curl_easy_init failed."
+        );
+
+        return false;
+    }
+
+    /*
+     * About 64 MiB is enough for a useful sustained-speed test.
+     */
+    NetworkDiagContext ctx = {
+        .bytes = 0,
+        .limit =
+            8ULL *
+            1024ULL *
+            1024ULL
+    };
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_URL,
+        unlock.direct_url
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_FOLLOWLOCATION,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_MAXREDIRS,
+        10L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_RANGE,
+        "0-8388607"
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEFUNCTION,
+        network_diag_write
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_WRITEDATA,
+        &ctx
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_XFERINFOFUNCTION,
+        network_diag_progress
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_XFERINFODATA,
+        &ctx
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOPROGRESS,
+        0L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_CONNECTTIMEOUT,
+        30L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_TIMEOUT,
+        0L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_NOSIGNAL,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYPEER,
+        1L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_SSL_VERIFYHOST,
+        2L
+    );
+
+    curl_easy_setopt(
+        curl,
+        CURLOPT_USERAGENT,
+        g_user_agent[0]
+            ? g_user_agent
+            : "SwitchDebridDownloader"
+    );
+
+    struct timespec start;
+    struct timespec end;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &start
+    );
+
+    CURLcode rc =
+        curl_easy_perform(
+            curl
+        );
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &end
+    );
+
+    long http_status = 0;
+
+    curl_easy_getinfo(
+        curl,
+        CURLINFO_RESPONSE_CODE,
+        &http_status
+    );
+
+    curl_easy_cleanup(
+        curl
+    );
+
+    bool intentionally_stopped =
+        (
+            rc ==
+            CURLE_ABORTED_BY_CALLBACK
+        ) &&
+        (
+            ctx.bytes >=
+            ctx.limit
+        );
+
+    if (
+        rc != CURLE_OK &&
+        !intentionally_stopped
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Network test failed: curl=%d HTTP=%ld",
+            (int)rc,
+            http_status
+        );
+
+        return false;
+    }
+
+    if (
+        http_status != 200 &&
+        http_status != 206
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Network test returned HTTP %ld.",
+            http_status
+        );
+
+        return false;
+    }
+
+    double seconds =
+        elapsed_seconds(
+            &start,
+            &end
+        );
+
+    if (seconds <= 0.0) {
+        snprintf(
+            error,
+            error_size,
+            "Invalid timing result."
+        );
+
+        return false;
+    }
+
+    if (bytes_tested)
+        *bytes_tested =
+            ctx.bytes;
+
+    if (mb_per_second) {
+        *mb_per_second =
+            (
+                (double)ctx.bytes /
+                1048576.0
+            ) /
+            seconds;
+    }
+
+    return true;
+}
+
+
+bool downloader_debug_sd(
+    double *mb_per_second,
+    char *error,
+    size_t error_size
+)
+{
+    if (mb_per_second)
+        *mb_per_second = 0.0;
+
+    DownloaderStats stats;
+
+    downloader_get_stats(
+        &stats
+    );
+
+    if (
+        stats.active > 0 ||
+        stats.queued > 0
+    ) {
+        snprintf(
+            error,
+            error_size,
+            "Stop/wait for normal downloads before running diagnostics."
+        );
+
+        return false;
+    }
+
+    ensure_directories();
+
+    static const char path[] =
+        DOWNLOAD_DIR "/.speedtest.tmp";
+
+    FILE *f =
+        fopen(
+            path,
+            "wb"
+        );
+
+    if (!f) {
+        snprintf(
+            error,
+            error_size,
+            "Could not create SD speed-test file."
+        );
+
+        return false;
+    }
+
+    const size_t block_size =
+        1024 * 1024;
+
+    const int blocks =
+        128;
+
+    unsigned char *buffer =
+        malloc(
+            block_size
+        );
+
+    if (!buffer) {
+        fclose(f);
+        remove(path);
+
+        snprintf(
+            error,
+            error_size,
+            "Out of memory."
+        );
+
+        return false;
+    }
+
+    memset(
+        buffer,
+        0xA5,
+        block_size
+    );
+
+    struct timespec start;
+    struct timespec end;
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &start
+    );
+
+    bool ok = true;
+
+    for (
+        int i = 0;
+        i < blocks;
+        i++
+    ) {
+        if (
+            fwrite(
+                buffer,
+                1,
+                block_size,
+                f
+            ) != block_size
+        ) {
+            ok = false;
+            break;
+        }
+    }
+
+    if (
+        ok &&
+        fflush(f) != 0
+    ) {
+        ok = false;
+    }
+
+    if (
+        ok &&
+        fsync(
+            fileno(f)
+        ) != 0
+    ) {
+        ok = false;
+    }
+
+    clock_gettime(
+        CLOCK_MONOTONIC,
+        &end
+    );
+
+    fclose(f);
+
+    free(buffer);
+
+    remove(path);
+
+    if (!ok) {
+        snprintf(
+            error,
+            error_size,
+            "SD write test failed."
+        );
+
+        return false;
+    }
+
+    double seconds =
+        elapsed_seconds(
+            &start,
+            &end
+        );
+
+    if (seconds <= 0.0) {
+        snprintf(
+            error,
+            error_size,
+            "Invalid timing result."
+        );
+
+        return false;
+    }
+
+    if (mb_per_second) {
+        *mb_per_second =
+            128.0 /
+            seconds;
+    }
+
+    return true;
+}
+
+
+/* ========================================================= */
+/* Public API                                                */
+/* ========================================================= */
+
+bool downloader_init(
+    const char *token,
+    const char *user_agent,
+    int max_concurrent
+)
+{
+    memset(
+        &g_queue,
+        0,
+        sizeof(g_queue)
+    );
+
+    memset(
+        g_worker_progress,
+        0,
+        sizeof(g_worker_progress)
+    );
+
+    g_completed = 0;
+    g_failed = 0;
+
+    mutexInit(
+        &g_mutex
+    );
+
+    snprintf(
+        g_token,
+        sizeof(g_token),
+        "%s",
+        token ? token : ""
+    );
+
+    snprintf(
+        g_user_agent,
+        sizeof(g_user_agent),
+        "%s",
+        user_agent
+            ? user_agent
+            : "SwitchDebridDownloader"
+    );
+
+    if (
+        max_concurrent < 1
+    ) {
+        max_concurrent = 1;
+    }
+
+    if (
+        max_concurrent >
+        MAX_WORKERS
+    ) {
+        max_concurrent =
+            MAX_WORKERS;
+    }
+
+    ensure_directories();
+
+    g_running = true;
+
+    for (
+        int i = 0;
+        i < max_concurrent;
+        i++
+    ) {
+        Result rc =
+            threadCreate(
+                &g_threads[i],
+                worker_thread,
+                (void *)(intptr_t)i,
+                NULL,
+                0x40000,
+                0x3B,
+                -2
+            );
+
+        if (
+            R_FAILED(rc)
+        ) {
+            break;
+        }
+
+        rc =
+            threadStart(
+                &g_threads[i]
+            );
+
+        if (
+            R_FAILED(rc)
+        ) {
+            threadClose(
+                &g_threads[i]
+            );
+
+            break;
+        }
+
+        g_thread_count++;
+    }
+
+    return
+        g_thread_count > 0;
+}
+
+
+void downloader_shutdown(void)
+{
+    if (!g_running)
+        return;
+
+    g_running = false;
+
+    for (
+        int i = 0;
+        i < g_thread_count;
+        i++
+    ) {
+        threadWaitForExit(
+            &g_threads[i]
+        );
+
+        threadClose(
+            &g_threads[i]
+        );
+    }
+
+    g_thread_count = 0;
+
+    mutexLock(
+        &g_mutex
+    );
+
+    while (
+        g_queue.count > 0
+    ) {
+        char *job =
+            g_queue.items[
+                g_queue.head
+            ];
+
+        g_queue.head =
+            (
+                g_queue.head +
+                1
+            ) %
+            MAX_QUEUE;
+
+        g_queue.count--;
+
+        free(job);
+    }
+
+    mutexUnlock(
+        &g_mutex
+    );
+}
+
+
+void downloader_get_stats(
+    DownloaderStats *stats
+)
+{
+    if (!stats)
+        return;
+
+    memset(
+        stats,
+        0,
+        sizeof(*stats)
+    );
+
+    mutexLock(
+        &g_mutex
+    );
+
+    stats->queued =
+        g_queue.count;
+
+    stats->completed =
+        g_completed;
+
+    stats->failed =
+        g_failed;
+
+    for (
+        int i = 0;
+        i < g_thread_count;
+        i++
+    ) {
+        if (
+            g_worker_progress[i].active
+        ) {
+            stats->active++;
+
+            stats->current_downloaded +=
+                g_worker_progress[i].downloaded;
+
+            stats->current_total +=
+                g_worker_progress[i].total;
+
+            stats->current_bytes_per_second +=
+                g_worker_progress[i].bytes_per_second;
+
+            if (
+                !stats->current_file[0] &&
+                g_worker_progress[i].filename[0]
+            ) {
+                snprintf(
+                    stats->current_file,
+                    sizeof(stats->current_file),
+                    "%s",
+                    g_worker_progress[i].filename
+                );
+            }
+        }
+    }
+
+    mutexUnlock(
+        &g_mutex
+    );
+}
